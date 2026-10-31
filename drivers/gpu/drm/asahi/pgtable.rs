@@ -60,7 +60,26 @@ const UAT_LVMSK: u64 = (UAT_LVSZ - 1) as u64;
 const UAT_LEVELS: usize = 3;
 
 /// UAT input address space
-pub(crate) const UAT_IAS: usize = 39;
+///
+/// **G15 widened this from 39 to 42 bits.** m1n1 carries the same conditional:
+///
+///     if Ver.check("G >= G15"):
+///         UAT_L0_OFF = 42
+///     else:
+///         UAT_L0_OFF = 39
+///
+/// It decides two things at once: how much of a VA survives the mask, and how
+/// many entries the top level has (`1 << (IAS - 36)`, so 8 at 39 bits and 64 at
+/// 42). Getting it wrong does not fail loudly -- it silently walks a *different
+/// top-level slot* than the hardware does. On t6030 the driver installed its L1
+/// pointer at index 2 while the GPU walked index 58, and the firmware took a
+/// level 1 translation fault reading InitData (LOG.md Part 30).
+///
+/// The proof that 42 is right: at 42 bits, top-level index 0 covers
+/// `0xfffffc0000000000`, which is exactly where the firmware's own text is
+/// mapped according to its crash log's address map. At 39 bits nothing lines up.
+// TODO: make this per-generation rather than assuming G15.
+pub(crate) const UAT_IAS: usize = 42;
 const UAT_IASMSK: u64 = (1u64 << UAT_IAS) - 1;
 
 const PTE_TYPE_BITS: u64 = 3;
@@ -233,6 +252,11 @@ impl Prot {
         self.ap != AP_GPU && self.memattr == MEMATTR_CACHED
     }
 
+    /// Same permissions with another memory attribute index (0 cached, 1 device, 2 uncached)
+    pub(crate) const fn with_memattr(&self, memattr: u8) -> Self {
+        self.memattr(memattr)
+    }
+
     pub(crate) const fn as_uncached(&self) -> Self {
         self.memattr(MEMATTR_UNCACHED)
     }
@@ -254,8 +278,14 @@ pub(crate) struct DumpedPage {
 pub(crate) struct UatPageTable {
     ttb: PhysicalAddr,
     ttb_owned: bool,
+    /// A temporary view onto a live VM's tables (diagnostic helpers): the
+    /// tables belong to that VM, so dropping the view must not free them.
+    view: bool,
     va_range: Range<u64>,
     oas_mask: u64,
+    /// Bitmask of top-level slots pointing at another VM's table (`share_top`):
+    /// never walked, changed or freed through this table.
+    shared_top: u64,
 }
 
 impl UatPageTable {
@@ -266,8 +296,10 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: true,
+            view: false,
             va_range: 0..(1u64 << UAT_IAS),
             oas_mask: (1u64 << oas) - 1,
+            shared_top: 0,
         })
     }
 
@@ -296,13 +328,61 @@ impl UatPageTable {
         Ok(UatPageTable {
             ttb,
             ttb_owned: false,
+            view: false,
             va_range,
             oas_mask: (1u64 << oas) - 1,
+            shared_top: 0,
         })
+    }
+
+    /// Borrow a live VM's page tables for a diagnostic read/poke.
+    ///
+    /// ⚠️ `new_with_ttb` is for the kernel VM, which owns the tables it
+    /// allocates: its `Drop` walks with `free=true`. Used as a throwaway view
+    /// onto a *user* VM (all the `*_slot` helpers in mmu.rs did), that walk
+    /// freed every live L1/L0 table of the VM; the pages were then handed out
+    /// again (e.g. as a GEM object) while the TTB still pointed at them, so
+    /// both the GPU and later maps walked garbage. LOG.md 32.41.578.
+    pub(crate) fn new_view(ttb: PhysicalAddr, va_range: Range<u64>, oas: u32) -> Result<Self> {
+        let mut pt = Self::new_with_ttb(ttb, va_range, oas)?;
+        pt.view = true;
+        Ok(pt)
     }
 
     pub(crate) fn ttb(&self) -> PhysicalAddr {
         self.ttb
+    }
+
+    /// Top-level PTE `idx` (0 = none).
+    pub(crate) fn top_pte(&self, idx: usize) -> Result<u64> {
+        // SAFETY: the TTB page is ours (or firmware-managed) and stays allocated.
+        let pt = unsafe { Page::borrow_phys_unchecked(&self.ttb) };
+        pt.with_pointer_into_page(idx * PTE_SIZE, PTE_SIZE, |p| {
+            // SAFETY: valid, aligned PTE pointer (with_pointer_into_page).
+            Ok(unsafe { &*(p as *const _ as *const Pte) }.load(Ordering::Relaxed))
+        })
+    }
+
+    /// Point top-level slot `idx` at another VM's table (`pte` from its `top_pte`).
+    /// That subtree stays owned by the other VM: this table skips the slot in
+    /// every walk (map/unmap/drop). LOG.md 32.41.667zzj.
+    pub(crate) fn share_top(&mut self, idx: usize, pte: u64) -> Result {
+        if pte & PTE_TYPE_BITS != PTE_TYPE_LEAF_TABLE || idx >= 64 || self.shared_top & (1 << idx) != 0 {
+            return Err(EINVAL);
+        }
+        // SAFETY: as in top_pte.
+        let pt = unsafe { Page::borrow_phys_unchecked(&self.ttb) };
+        pt.with_pointer_into_page(idx * PTE_SIZE, PTE_SIZE, |p| {
+            // SAFETY: valid, aligned PTE pointer (with_pointer_into_page).
+            let ptep = unsafe { &*(p as *const _ as *const Pte) };
+            if ptep.load(Ordering::Relaxed) != 0 {
+                return Err(EBUSY);
+            }
+            ptep.store(pte, Ordering::Relaxed);
+            Ok(())
+        })?;
+        self.shared_top |= 1 << idx;
+        Ok(())
     }
 
     fn with_pages<F>(
@@ -340,6 +420,7 @@ impl UatPageTable {
 
         let mut pt_addr: [Option<PhysicalAddr>; UAT_LEVELS] = Default::default();
         pt_addr[UAT_LEVELS - 1] = Some(self.ttb);
+        let shared_top = self.shared_top;
 
         'outer: while iova < end {
             mod_pr_debug!("UATPageTable::with_pages: iova={:#x}\n", iova);
@@ -373,6 +454,12 @@ impl UatPageTable {
                     );
                     let upidx = ((iova >> (UAT_PGBIT + (level + 1) * UAT_LVBIT) as u64) & UAT_LVMSK)
                         as usize;
+                    if level == UAT_LEVELS - 2 && upidx < 64 && shared_top & (1 << upidx) != 0 {
+                        // Another VM's subtree (share_top): skip it.
+                        let block = 1 << (UAT_PGBIT + UAT_LVBIT * (level + 1));
+                        iova = align(iova + 1, block);
+                        continue 'outer;
+                    }
                     // SAFETY: Page table addresses are either allocated by us, or
                     // firmware-managed and safe to borrow a struct page from.
                     let upt = unsafe { Page::borrow_phys_unchecked(&phys) };
@@ -384,11 +471,27 @@ impl UatPageTable {
                             // and our index is aligned so it is safe to deref as an AtomicU64.
                             let upte = unsafe { &*uptep };
                             let mut upte_val = upte.load(Ordering::Relaxed);
+                            // Single-line: "{:#x?}" on the Option below prints
+                            // one field per line and only the first survives.
+                            mod_pr_debug!(
+                                "UATPageTable::with_pages: level {} upidx {:#x} upte {:#x}\n",
+                                level,
+                                upidx,
+                                upte_val
+                            );
                             // Allocate if requested
                             if upte_val == 0 && alloc {
                                 let pt_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
                                 mod_pr_debug!("UATPageTable::with_pages: alloc PT at {:#x}\n", pt_page.phys());
                                 let pt_paddr = Page::into_phys(pt_page);
+                                // LOG.md 32.41.577: a table PTE shows up in a replay data
+                                // page at page offset 0x2000 (index 0x400).  Name the walk.
+                                if upidx == 0x400 && crate::debug::verbose() {
+                                    pr_info!(
+                                        "asahi/pt400: iova {:#x} level {} parent {:#x} -> new PT {:#x}\n",
+                                        iova, level, phys, pt_paddr
+                                    );
+                                }
                                 upte_val = pt_paddr | PTE_TYPE_LEAF_TABLE;
                                 upte.store(upte_val, Ordering::Relaxed);
                             }
@@ -562,6 +665,423 @@ impl UatPageTable {
     }
 
     #[cfg(CONFIG_DEV_COREDUMP)]
+    /// Look up a single IOVA: report its PTE and the first words of the page.
+    ///
+    /// `dump_pages` copies whole pages and allocates; this is the cheap version,
+    /// for answering "is this address mapped, and what is in it" from a fault
+    /// handler. Returns `None` when the leaf PTE is not present.
+    /// Write one 64-bit word at a user IOVA, for the `cs_poke_*` diagnostic.
+    ///
+    /// Same page-table walk and `borrow_phys` argument as `probe`, plus a cache
+    /// clean so the GPU (which reads this memory uncached) sees the store.
+    /// Returns true if the page was mapped and the write happened.
+    pub(crate) fn poke(&mut self, iova: u64, val: u64) -> bool {
+        let base = iova & !(UAT_PGMSK as u64);
+        let off = (iova & (UAT_PGMSK as u64)) as usize;
+        let oas_mask = self.oas_mask;
+        let mut done = false;
+
+        let _ = self.with_pages(base..(base + UAT_PGSZ as u64), false, false, |_, ptes| {
+            let pte = match ptes.first() {
+                Some(p) => p.load(Ordering::Relaxed),
+                None => return Ok(()),
+            };
+            if (pte & PTE_TYPE_LEAF_TABLE) != PTE_TYPE_LEAF_TABLE {
+                return Ok(());
+            }
+            if off + 8 > UAT_PGSZ {
+                return Ok(());
+            }
+            let phys = pte & oas_mask & (!UAT_PGMSK as u64);
+            // SAFETY: same argument as `probe`.
+            if let Some(page) = unsafe { Page::borrow_phys(&phys) } {
+                page.with_page_mapped(|p| {
+                    // SAFETY: `off + 8 <= UAT_PGSZ` keeps the write inside the
+                    // mapped page.
+                    unsafe {
+                        core::ptr::write_unaligned(p.add(off) as *mut u64, val);
+                    }
+                    // ⚠️ The DSB between the store and the cache maintenance is
+                    // load-bearing, not decoration. `DC CIVAC` is not ordered
+                    // with respect to preceding stores without one, so without
+                    // it the clean can run *before* the store lands and the GPU
+                    // reads the stale line -- intermittently. That produced two
+                    // byte-identical runs with opposite outcomes and cost the
+                    // retraction in LOG.md 32.41.174.
+                    crate::mem::sync();
+                    crate::mem::dc_civac(unsafe { p.add(off) } as *const u8);
+                });
+                crate::mem::sync();
+                done = true;
+            }
+            Ok(())
+        });
+        done
+    }
+
+    /// Fill `count` 32-bit words at `iova` with `word`, all within one page.
+    ///
+    /// The terminator sweep needs to plant `0xc0000000` at every dword across a
+    /// range in a single run: each boot submits exactly one job, so probing one
+    /// candidate boundary per boot costs ~5 minutes per bit. Filling a range
+    /// answers "does the record end anywhere in here" in one run instead.
+    /// LOG.md 32.41.163.
+    pub(crate) fn poke_fill(&mut self, iova: u64, word: u32, count: usize) -> bool {
+        let base = iova & !(UAT_PGMSK as u64);
+        let off = (iova & (UAT_PGMSK as u64)) as usize;
+        let oas_mask = self.oas_mask;
+        let mut done = false;
+
+        let _ = self.with_pages(base..(base + UAT_PGSZ as u64), false, false, |_, ptes| {
+            let pte = match ptes.first() {
+                Some(p) => p.load(Ordering::Relaxed),
+                None => return Ok(()),
+            };
+            if (pte & PTE_TYPE_LEAF_TABLE) != PTE_TYPE_LEAF_TABLE {
+                return Ok(());
+            }
+            // One page only: the control stream starts page-aligned, so any
+            // sweep of interest lives in the first page.
+            if off + count * 4 > UAT_PGSZ {
+                return Ok(());
+            }
+            let phys = pte & oas_mask & (!UAT_PGMSK as u64);
+            // SAFETY: same argument as `probe`.
+            if let Some(page) = unsafe { Page::borrow_phys(&phys) } {
+                page.with_page_mapped(|p| {
+                    for i in 0..count {
+                        // SAFETY: bounds checked above.
+                        unsafe {
+                            core::ptr::write_unaligned(
+                                p.add(off + i * 4) as *mut u32,
+                                word,
+                            );
+                        }
+                    }
+                    // All stores first, then one barrier, then the cleans --
+                    // `DC CIVAC` is unordered with respect to prior stores
+                    // without an intervening DSB. See `poke` above and
+                    // LOG.md 32.41.175.
+                    crate::mem::sync();
+                    for i in 0..count {
+                        // SAFETY: bounds checked above.
+                        unsafe {
+                            crate::mem::dc_civac(p.add(off + i * 4) as *const u8);
+                        }
+                    }
+                });
+                crate::mem::sync();
+                done = true;
+            }
+            Ok(())
+        });
+        done
+    }
+
+    /// Read-modify-write every dword in `[iova, iova + count*4)` that matches
+    /// `(w & mask) == val`, ORing `or_val` into it.  Returns how many were
+    /// changed.
+    ///
+    /// Same single-page restriction and same store/DSB/DC-CIVAC ordering as
+    /// `poke_fill`; see LOG.md 32.41.175 for why the barrier has to sit between
+    /// the stores and the cleans.
+    pub(crate) fn patch_dwords(
+        &mut self,
+        iova: u64,
+        count: usize,
+        mask: u32,
+        val: u32,
+        or_val: u32,
+        and_val: u32,
+    ) -> usize {
+        let base = iova & !(UAT_PGMSK as u64);
+        let off = (iova & (UAT_PGMSK as u64)) as usize;
+        let oas_mask = self.oas_mask;
+        let mut hits = 0usize;
+
+        let _ = self.with_pages(base..(base + UAT_PGSZ as u64), false, false, |_, ptes| {
+            let pte = match ptes.first() {
+                Some(p) => p.load(Ordering::Relaxed),
+                None => return Ok(()),
+            };
+            if (pte & PTE_TYPE_LEAF_TABLE) != PTE_TYPE_LEAF_TABLE {
+                return Ok(());
+            }
+            if off + count * 4 > UAT_PGSZ {
+                return Ok(());
+            }
+            let phys = pte & oas_mask & (!UAT_PGMSK as u64);
+            // SAFETY: same argument as `probe`.
+            if let Some(page) = unsafe { Page::borrow_phys(&phys) } {
+                page.with_page_mapped(|p| {
+                    for i in 0..count {
+                        // SAFETY: bounds checked above.
+                        let q = unsafe { p.add(off + i * 4) as *mut u32 };
+                        // SAFETY: as above.
+                        let w = unsafe { core::ptr::read_unaligned(q) };
+                        if (w & mask) == val {
+                            let n = (w & and_val) | or_val;
+                            if n != w {
+                                // SAFETY: as above.
+                                unsafe { core::ptr::write_unaligned(q, n) };
+                                hits += 1;
+                            }
+                        }
+                    }
+                    crate::mem::sync();
+                    for i in 0..count {
+                        // SAFETY: as above.
+                        unsafe {
+                            crate::mem::dc_civac(p.add(off + i * 4) as *const u8);
+                        }
+                    }
+                });
+                crate::mem::sync();
+            }
+            Ok(())
+        });
+        hits
+    }
+
+    /// Clear bits [31:16] of every stream dword the G15S VDM reads as a count.
+    ///
+    /// The defect (LOG.md 32.41.320/.321): the VDM takes bits [31:16] of a
+    /// record's low dword as a count, and Mesa writes a 32-bit address there.
+    /// `0xfff88b18` means "consume 65528 units", so the decoder walks the zero
+    /// fill past the end of the stream and faults off the end of the BO.
+    ///
+    /// Identifying the record by *content* rather than by a fixed offset,
+    /// because the offset moves between frames (32.41.329). A bare
+    /// "any `0xfff8xxxx`" rule is wrong -- `cs+0x08` holds `0xfff88010` and is a
+    /// perfectly well-behaved record (32.41.317, boundary 3/3). The two are
+    /// distinguished by the dword that follows: `0x0000142f` for the pathological
+    /// one, `0x40000000` for the good one. So require the successor to be small,
+    /// which is the only discriminator the measurements support.
+    ///
+    /// Returns the number of dwords patched.
+    pub(crate) fn fix_count_dwords(&mut self, iova: u64, count: usize) -> usize {
+        let base = iova & !(UAT_PGMSK as u64);
+        let off = (iova & (UAT_PGMSK as u64)) as usize;
+        let oas_mask = self.oas_mask;
+        let mut hits = 0usize;
+
+        let _ = self.with_pages(base..(base + UAT_PGSZ as u64), false, false, |_, ptes| {
+            let pte = match ptes.first() {
+                Some(p) => p.load(Ordering::Relaxed),
+                None => return Ok(()),
+            };
+            if (pte & PTE_TYPE_LEAF_TABLE) != PTE_TYPE_LEAF_TABLE {
+                return Ok(());
+            }
+            if off + (count + 1) * 4 > UAT_PGSZ {
+                return Ok(());
+            }
+            let phys = pte & oas_mask & (!UAT_PGMSK as u64);
+            // SAFETY: same argument as `probe`.
+            if let Some(page) = unsafe { Page::borrow_phys(&phys) } {
+                page.with_page_mapped(|p| {
+                    for i in 0..count {
+                        // SAFETY: bounds checked above.
+                        let q = unsafe { p.add(off + i * 4) as *mut u32 };
+                        // SAFETY: as above.
+                        let w = unsafe { core::ptr::read_unaligned(q) };
+                        if (w & 0xffff_0000) != 0xfff8_0000 {
+                            continue;
+                        }
+                        // SAFETY: `count + 1` bounds-checked above.
+                        let nx = unsafe {
+                            core::ptr::read_unaligned(p.add(off + (i + 1) * 4) as *const u32)
+                        };
+                        if nx >= 0x1_0000 {
+                            continue;
+                        }
+                        // SAFETY: as above.
+                        unsafe { core::ptr::write_unaligned(q, w & 0xffff) };
+                        hits += 1;
+                    }
+                    if hits != 0 {
+                        crate::mem::sync();
+                        for i in 0..count {
+                            // SAFETY: as above.
+                            unsafe {
+                                crate::mem::dc_civac(p.add(off + i * 4) as *const u8);
+                            }
+                        }
+                    }
+                });
+                crate::mem::sync();
+            }
+            Ok(())
+        });
+        hits
+    }
+
+    /// Find a dword matching `(w & mask) == val` and write `writes` relative to it.
+    ///
+    /// `patch_dwords` can only rewrite the matched word itself, but the G15 draw
+    /// record is eight dwords and the fields that need filling sit *after* its
+    /// CTRL word (LOG.md 32.41.299). Each `(idx, value)` in `writes` is a dword
+    /// index relative to the match, so Apple's record can be transcribed onto
+    /// Mesa's in place. Only the first match is spliced -- the stream holds one
+    /// draw. Same single-page limit and same store/DSB/DC-CIVAC ordering as
+    /// `patch_dwords`.
+    pub(crate) fn splice_dwords(
+        &mut self,
+        iova: u64,
+        count: usize,
+        mask: u32,
+        val: u32,
+        writes: &[(usize, u32)],
+    ) -> usize {
+        let base = iova & !(UAT_PGMSK as u64);
+        let off = (iova & (UAT_PGMSK as u64)) as usize;
+        let oas_mask = self.oas_mask;
+        let mut hits = 0usize;
+
+        // The furthest dword any write touches, so the whole record can be
+        // bounds-checked against the page before anything is stored.
+        let reach = writes.iter().map(|(i, _)| *i).max().unwrap_or(0);
+
+        let _ = self.with_pages(base..(base + UAT_PGSZ as u64), false, false, |_, ptes| {
+            let pte = match ptes.first() {
+                Some(p) => p.load(Ordering::Relaxed),
+                None => return Ok(()),
+            };
+            if (pte & PTE_TYPE_LEAF_TABLE) != PTE_TYPE_LEAF_TABLE {
+                return Ok(());
+            }
+            if off + (count + reach) * 4 > UAT_PGSZ {
+                return Ok(());
+            }
+            let phys = pte & oas_mask & (!UAT_PGMSK as u64);
+            // SAFETY: same argument as `probe`.
+            if let Some(page) = unsafe { Page::borrow_phys(&phys) } {
+                page.with_page_mapped(|p| {
+                    let mut lo = 0usize;
+                    let mut hi = 0usize;
+                    for i in 0..count {
+                        // SAFETY: bounds checked above.
+                        let q = unsafe { p.add(off + i * 4) as *mut u32 };
+                        // SAFETY: as above.
+                        let w = unsafe { core::ptr::read_unaligned(q) };
+                        if (w & mask) != val {
+                            continue;
+                        }
+                        for (idx, value) in writes.iter() {
+                            // SAFETY: bounds checked above via `reach`.
+                            let t = unsafe { p.add(off + (i + idx) * 4) as *mut u32 };
+                            // SAFETY: as above.
+                            unsafe { core::ptr::write_unaligned(t, *value) };
+                        }
+                        lo = i;
+                        hi = i + reach;
+                        hits += 1;
+                        break;
+                    }
+                    if hits != 0 {
+                        crate::mem::sync();
+                        for i in lo..=hi {
+                            // SAFETY: as above.
+                            unsafe {
+                                crate::mem::dc_civac(p.add(off + i * 4) as *const u8);
+                            }
+                        }
+                    }
+                });
+                crate::mem::sync();
+            }
+            Ok(())
+        });
+        hits
+    }
+
+    /// Read `count` dwords from `iova` into `out`, returning how many were read.
+    ///
+    /// Read-only twin of `patch_dwords`: same single-page limit, same borrow of
+    /// the leaf PTE's physical page. Used to dump the VDM control stream exactly
+    /// as the GPU sees it, which is the only way to check the CSD's cursor
+    /// advance against the records Mesa actually wrote. LOG.md 32.41.298.
+    pub(crate) fn read_dwords(&mut self, iova: u64, out: &mut [u32]) -> usize {
+        let base = iova & !(UAT_PGMSK as u64);
+        let off = (iova & (UAT_PGMSK as u64)) as usize;
+        let oas_mask = self.oas_mask;
+        let count = out.len();
+        let mut got = 0usize;
+
+        let _ = self.with_pages(base..(base + UAT_PGSZ as u64), false, false, |_, ptes| {
+            let pte = match ptes.first() {
+                Some(p) => p.load(Ordering::Relaxed),
+                None => return Ok(()),
+            };
+            if (pte & PTE_TYPE_LEAF_TABLE) != PTE_TYPE_LEAF_TABLE {
+                return Ok(());
+            }
+            if off + count * 4 > UAT_PGSZ {
+                return Ok(());
+            }
+            let phys = pte & oas_mask & (!UAT_PGMSK as u64);
+            // SAFETY: same argument as `probe`.
+            if let Some(page) = unsafe { Page::borrow_phys(&phys) } {
+                page.with_page_mapped(|p| {
+                    for i in 0..count {
+                        // SAFETY: bounds checked above.
+                        unsafe {
+                            crate::mem::dc_civac(p.add(off + i * 4) as *const u8);
+                        }
+                    }
+                    crate::mem::sync();
+                    for i in 0..count {
+                        // SAFETY: bounds checked above.
+                        let q = unsafe { p.add(off + i * 4) as *const u32 };
+                        // SAFETY: as above.
+                        out[i] = unsafe { core::ptr::read_unaligned(q) };
+                    }
+                    got = count;
+                });
+            }
+            Ok(())
+        });
+        got
+    }
+
+    pub(crate) fn probe(&mut self, iova: u64) -> Option<(u64, [u64; 8])> {
+        let base = iova & !(UAT_PGMSK as u64);
+        let off = (iova & (UAT_PGMSK as u64)) as usize;
+        let oas_mask = self.oas_mask;
+        let mut out: Option<(u64, [u64; 8])> = None;
+
+        let _ = self.with_pages(base..(base + UAT_PGSZ as u64), false, false, |_, ptes| {
+            let pte = match ptes.first() {
+                Some(p) => p.load(Ordering::Relaxed),
+                None => return Ok(()),
+            };
+            if (pte & PTE_TYPE_LEAF_TABLE) != PTE_TYPE_LEAF_TABLE {
+                return Ok(());
+            }
+            let mut words = [0u64; 8];
+            let phys = pte & oas_mask & (!UAT_PGMSK as u64);
+            // SAFETY: same argument as `dump_pages` -- a present leaf PTE in a
+            // live page table points at a page that is either firmware-owned,
+            // a page table page, or a locked GEM page, all of which are safe to
+            // borrow for a read.
+            if let Some(page) = unsafe { Page::borrow_phys(&phys) } {
+                page.with_page_mapped(|p| {
+                    for (i, w) in words.iter_mut().enumerate() {
+                        let o = off + i * 8;
+                        if o + 8 <= UAT_PGSZ {
+                            // SAFETY: `o + 8 <= UAT_PGSZ` keeps the read inside
+                            // the mapped page.
+                            *w = unsafe { core::ptr::read_unaligned(p.add(o) as *const u64) };
+                        }
+                    }
+                });
+            }
+            out = Some((pte, words));
+            Ok(())
+        });
+        out
+    }
+
     pub(crate) fn dump_pages(&mut self, iova_range: Range<u64>) -> Result<KVVec<DumpedPage>> {
         let mut pages = KVVec::new();
         let oas_mask = self.oas_mask;
@@ -663,15 +1183,34 @@ impl UatPageTable {
 impl Drop for UatPageTable {
     fn drop(&mut self) {
         mod_pr_debug!("UATPageTable::drop range: {:#x?}\n", &self.va_range);
+        if self.view {
+            return;
+        }
         if self
             .with_pages(self.va_range.clone(), false, true, |iova, ptes| {
+                // ⚠️ `user_va_bias2` leaks a page per user mapping *by design*
+                // (mmu.rs `user_iova_bias2`), and one line each overruns the
+                // kmsg ring: 32.41.253's `render-full2`/`full3` logs both carry
+                // "/dev/kmsg buffer overrun, some messages lost", which is how
+                // a `patch` line that may well have been printed went missing
+                // and nearly got the fix scored as not applied.  Count them and
+                // print one line.  LOG.md 32.41.254.
+                let mut leaked = 0usize;
+                let mut first = 0u64;
                 for (idx, pte) in ptes.iter().enumerate() {
                     if pte.load(Ordering::Relaxed) != 0 {
-                        pr_err!(
-                            "UATPageTable::drop: Leaked page at IOVA {:#x}\n",
-                            iova + (idx * UAT_PGSZ) as u64
-                        );
+                        if leaked == 0 {
+                            first = iova + (idx * UAT_PGSZ) as u64;
+                        }
+                        leaked += 1;
                     }
+                }
+                if leaked != 0 {
+                    pr_err!(
+                        "UATPageTable::drop: {} leaked page(s), first at IOVA {:#x}\n",
+                        leaked,
+                        first
+                    );
                 }
                 Ok(())
             })

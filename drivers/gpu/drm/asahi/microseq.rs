@@ -49,6 +49,32 @@ impl Builder {
         // SAFETY: Microseq operations always have no padding bytes, so it is safe to
         // access them as a byte slice.
         let s: &[u8] = unsafe { core::slice::from_raw_parts(p, core::mem::size_of::<T>()) };
+        // 32.41.445: log the exact op list the driver emits -- opcode, offset and
+        // struct size. The #[ver] gating makes the G15S sequence hard to read off
+        // the source, and 32.41.444 narrowed the stop to "after StartVertex, before
+        // RetireStamp" without knowing what sits between them. The firmware's own
+        // stride for each opcode is the `w21` its handler sets, so a mismatch
+        // between our size here and that stride would desync the interpreter.
+        if *crate::module_parameters::dump_microseq.value() != 0 {
+            let hdr = if s.len() >= 4 {
+                u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+            } else {
+                0
+            };
+            pr_info!(
+                "asahi/useq +{:#05x} opcode {:#04x} size {:#x} hdr {:#010x}\n",
+                off,
+                hdr & 0x3f,
+                s.len(),
+                hdr,
+            );
+        }
+        // 32.41.588: dump_microseq=2 also dumps the op bytes (diff vs Apple's).
+        if *crate::module_parameters::dump_microseq.value() >= 2 {
+            for (i, c) in s.chunks(16).enumerate() {
+                pr_info!("asahi/useqb +{:#05x} {:02x?}\n", off + i * 16, c);
+            }
+        }
         self.ops.extend_from_slice(s, GFP_KERNEL)?;
         Ok(off as i32)
     }

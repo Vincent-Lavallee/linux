@@ -54,6 +54,11 @@ pub(crate) type Event = slotalloc::Guard<EventInner>;
 pub(crate) struct EventValue(u32);
 
 impl EventValue {
+    /// The raw stamp word, for diagnostics.
+    pub(crate) fn counter(&self) -> u32 {
+        self.0
+    }
+
     /// Returns the `EventValue` that succeeds this one.
     pub(crate) fn next(&self) -> EventValue {
         EventValue(self.0.wrapping_add(0x100))
@@ -179,6 +184,31 @@ impl EventManager {
                 static_lock_class!(),
             )?,
         })
+    }
+
+    /// Dump the shared stamp array.
+    ///
+    /// The barrier's `wait_stamp` is an `fw_stamp`, which lives in
+    /// `alloc.private` and cannot be read back from the CPU; `stamps` is shared
+    /// and carries the same values the completion path publishes. Slot `n`
+    /// initialises to `n << 24`, so a slot still reading exactly that has never
+    /// advanced. LOG.md 32.41.110.
+    pub(crate) fn dump_stamps(&self, dev: &crate::driver::AsahiDevice, n: usize) {
+        self.alloc.with_inner(|inner| {
+            for slot in 0..n.min(NUM_EVENTS as usize) {
+                let v = inner.stamps[slot].0.load(Ordering::Relaxed);
+                if v != ((slot as u32) << 24) || slot < 3 {
+                    dev_err!(
+                        dev.as_ref(),
+                        "  asahi/hung: stamp[{}] = {:#x} (init {:#x}){}\n",
+                        slot,
+                        v,
+                        (slot as u32) << 24,
+                        if inner.owners[slot].is_some() { " [owned]" } else { "" },
+                    );
+                }
+            }
+        });
     }
 
     /// Gets a free `Event`, optionally trying to reuse the last one allocated by this caller.

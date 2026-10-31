@@ -153,6 +153,7 @@ pub(crate) trait GenSubmittedWork: Send + Sync {
     fn value(&self) -> event::EventValue;
     fn wptr(&self) -> u32;
     fn set_wptr(&mut self, wptr: u32);
+    fn raw_bytes_mut(&mut self) -> &mut [u8];
     fn mark_error(&mut self, error: WorkError);
     fn complete(&mut self);
     fn get_fence(&self) -> dma_fence::Fence;
@@ -203,6 +204,10 @@ impl<O: OpaqueCommandObject, C: FnOnce(Option<WorkError>) + Send + Sync> GenSubm
         self.wptr = wptr;
     }
 
+    fn raw_bytes_mut(&mut self) -> &mut [u8] {
+        self.object.raw_bytes_mut()
+    }
+
     fn complete(&mut self) {
         if let Some(cb) = self.callback.take() {
             cb(self.error);
@@ -241,7 +246,24 @@ struct WorkQueueInner {
     priority: u32,
     commit_seq: u64,
     submit_seq: u64,
+    /// Mirror of the firmware's per-event-slot DAG sequence counter.
+    ///
+    /// See the comment in `Job::submit`. Not the ring position: barriers do not
+    /// advance it, and an `InitBuffer` sets it outright.
+    #[ver(V >= V15_5)]
+    dag_seq: u32,
     event_seq: u64,
+    /// Counted as busy in the GPU usage statistics (`stats.rs`): has work pending.
+    busy: bool,
+    /// Work failed by a host recovery while the firmware may still reference
+    /// it: completed (fences signalled) but kept allocated until the queue
+    /// goes away. LOG.md 32.41.667zzz29.
+    zombies: KVec<Pin<KBox<SubmittedWorkContainer>>>,
+    /// Set by `abandon`: the queue lost work to a GPU hang; refuse new work.
+    dead: bool,
+    /// Process that created the queue (tgid + comm), named when its work fails.
+    owner_pid: i32,
+    owner_comm: [u8; 16],
 }
 
 /// An instance of a work queue.
@@ -261,6 +283,20 @@ impl WorkQueueInner::ver {
         self.info
             .state
             .with(|raw, _inner| raw.gpu_doneptr.load(Ordering::Acquire))
+    }
+
+    /// The firmware's read pointer into the ring, for diagnostics.
+    fn rptr(&self) -> u32 {
+        self.info
+            .state
+            .with(|raw, _inner| raw.gpu_rptr.load(Ordering::Acquire))
+    }
+
+    /// The driver's write pointer into the ring, for diagnostics.
+    fn wptr(&self) -> u32 {
+        self.info
+            .state
+            .with(|raw, _inner| raw.cpu_wptr.load(Ordering::Acquire))
     }
 }
 
@@ -473,6 +509,133 @@ impl Job::ver {
         for mut command in self.pending.drain(..) {
             command.as_mut().inner_mut().set_wptr(wptr);
 
+            // 15.5's DAG walker keeps a per-slot counter that ticks once per
+            // command it takes off this ring, and panics -- "Non Sequential
+            // Stamp Updates seen" -- unless bits 8..14 of a word in the command
+            // match it. The ring is WQ_SIZE = 0x500 entries, a multiple of 128,
+            // so the ring position stays in step with that counter for as long
+            // as the queue lives. The word's offset is per command type, so key
+            // it off the tag at +0. LOG.md 32.41.5.
+            // 🔑 The DAG sequence counter is **not** the ring position.
+            //
+            // It lives per *event slot* at `0xe4980 + slot * 0x38 + 8`, and the
+            // command tag decides what happens to it (`fw:0x191b4` dispatch):
+            //
+            //   tags 0/1/2/3 (Run*)  `fw:0x19ce4` compares bits 8..14 of a word
+            //                        in the command against it and panics on a
+            //                        mismatch, then increments it (`fw:0x19ef0`)
+            //   tag 6 InitBuffer     `fw:0x19bb0` *assigns* it from bits 8..14
+            //   tag 5                same, from the word at +0x14
+            //   tag 4 Barrier        `fw:0x19308` -- neither checks nor advances
+            //
+            // Stamping the ring position worked on the vertex queue purely by
+            // coincidence: its `InitBuffer` at ring[0] carries `stamp_value`
+            // 0x100 at +0x1c, which set the counter to 1, and `RunVertex` at
+            // ring[1] then wanted 1. The fragment queue has a *barrier* at
+            // ring[0], which advances nothing, so its counter was still 0 when
+            // `RunFragment` arrived carrying 1 -- and the firmware crashed with
+            // "DAG: Non Sequential Stamp Updates seen entryIdx 0x1
+            // roots.dag 0x0". LOG.md 32.41.104.
+            #[ver(V >= V15_5)]
+            {
+                let dag_seq = &mut inner.dag_seq;
+                let bytes = command.as_mut().inner_mut().raw_bytes_mut();
+                let tag = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                let off = match tag {
+                    0 => Some(0x878_usize), // RunVertex
+                    1 => Some(0xbbc),       // RunFragment
+                    2 => Some(0x8bc),       // RunBlitter
+                    3 => Some(0x7f8),       // RunCompute
+                    _ => None,
+                };
+                match tag {
+                    // Barrier: does not participate.
+                    4 => {}
+                    // Assigns the counter. The driver only ever emits tag 6,
+                    // whose word is `stamp_value` at +0x1c; tag 5 uses +0x14.
+                    5 | 6 => {
+                        let at = if tag == 6 { 0x1c } else { 0x14 };
+                        if bytes.len() >= at + 4 {
+                            let w = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+                            *dag_seq = (w >> 8) & 0x7f;
+                        }
+                    }
+                    // 32.41.597: RunCompute's DAG word *is* JobMeta.stamp_value
+                    // (0x7f8), and the deferred compute completion (ktrace 0x0e)
+                    // writes exactly that word to the stamp. Overwriting it with
+                    // our counter made the first job stamp 0 (target 0x100) -> never
+                    // signalled. Apple: word 0x600 == stamp value. fw:0x19bb0 adopts
+                    // the first command's sequence for a new owner, so keep the
+                    // event value and track the counter from it.
+                    3 if *crate::module_parameters::dag_from_stamp.value() != 0 => {
+                        if bytes.len() >= 0x7fc {
+                            let w = u32::from_le_bytes(bytes[0x7f8..0x7fc].try_into().unwrap());
+                            *dag_seq = ((w >> 8) + 1) & 0x7f;
+                        }
+                    }
+                    // 32.41.609: the same holds for vertex/fragment/blit. The
+                    // overwrite below replaced RunFragment's stamp_value (+0xbbc)
+                    // with the fragment queue's counter (0 after the ring[0]
+                    // barrier), so the firmware signalled the fragment stamp with
+                    // 0 and the job never completed. Vertex only worked because
+                    // its counter happened to equal its stamp (0x100).
+                    0..=2 if *crate::module_parameters::dag_from_stamp.value() == 2 => {
+                        if let Some(off) = off {
+                            if bytes.len() >= off + 4 {
+                                let w = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                                *dag_seq = ((w >> 8) + 1) & 0x7f;
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(off) = off {
+                            if bytes.len() >= off + 4 {
+                                let word = (*dag_seq & 0x7f) << 8;
+                                bytes[off..off + 4].copy_from_slice(&word.to_le_bytes());
+                            }
+                        }
+                        *dag_seq = (*dag_seq + 1) & 0x7f;
+                    }
+                }
+                // .592: dump the committed RunCompute (nonzero 16-byte rows) to
+                // diff against Apple's captured command (cl-capture "at complete").
+                // 667zzy: SubmitTrace only -- Vulkan submits compute all the time.
+                if tag == 3 && debug_enabled(DebugFlags::SubmitTrace) {
+                    let mut o = 0;
+                    while o + 16 <= bytes.len() {
+                        let r = &bytes[o..o + 16];
+                        if r.iter().any(|&b| b != 0) {
+                            pr_info!("asahi/ccmd {:#05x}: {:02x?}\n", o, r);
+                        }
+                        o += 16;
+                    }
+                }
+                // A barrier is 0x40 bytes and every field the firmware reads
+                // is inside it; dump it as committed so what the firmware sees
+                // can be checked against what the initializer meant.
+                if tag == 4 && bytes.len() >= 0x38 {
+                    let w = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+                    let q = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+                    crate::sub_pr_info!(
+                        "asahi: barrier: stamp {:#x} stamp2 {:#x} value {:#x} type {:#x} flags_slot {:#x} self {:#x} armed {:#x}\n",
+                        q(0x04),
+                        q(0x0c),
+                        w(0x14),
+                        w(0x20),
+                        w(0x24),
+                        w(0x28),
+                        w(0x30),
+                    );
+                }
+                crate::sub_pr_info!(
+                    "asahi: commit: ring[{}] tag {} len {:#x} dag_seq -> {}\n",
+                    wptr,
+                    tag,
+                    bytes.len(),
+                    inner.dag_seq,
+                );
+            }
+
             let next_wptr = (wptr + 1) % inner.size;
             assert!(inner.doneptr() != next_wptr);
             inner.info.ring[wptr as usize] = command.inner.gpu_va().get();
@@ -484,6 +647,7 @@ impl Job::ver {
                 .push(command, GFP_KERNEL)
                 .expect("push() failed after reserve()");
         }
+        inner.update_busy();
 
         self.submitted = true;
 
@@ -518,9 +682,24 @@ impl<'a> JobSubmission::ver<'a> {
         let msg = fw::channels::RunWorkQueueMsg::ver {
             pipe_type: inner.pipe_type,
             work_queue: Some(inner.info.weak_pointer()),
+            #[ver(V < V15_5)]
             wptr: inner.wptr,
+            // 15.5 narrowed both: wptr to a halfword (WQ_SIZE is 0x500) and
+            // the event slot to a byte (there are 128). `pipe_kind` has to
+            // carry the pipe type: each of the three ring consumers accepts
+            // only its own value there and discards anything else.
+            #[ver(V >= V15_5)]
+            unk_4: 0,
+            #[ver(V >= V15_5)]
+            pipe_kind: inner.pipe_type as u32,
+            #[ver(V >= V15_5)]
+            wptr: inner.wptr as u16,
+            #[ver(V >= V15_5)]
+            event_slot: event_slot as u8,
+            #[ver(V < V15_5)]
             event_slot,
             is_new: inner.new,
+            #[ver(V < V15_5)]
             __pad: Default::default(),
         };
         channel.send(&msg);
@@ -535,6 +714,87 @@ impl<'a> JobSubmission::ver<'a> {
 
     pub(crate) fn priority(&self) -> u32 {
         self.inner.as_ref().expect("No inner?").priority
+    }
+}
+
+#[versions(AGX)]
+impl WorkQueue::ver {
+    /// Read the firmware's completion stamp straight out of shared memory.
+    ///
+    /// This answers "did the work complete and only the notification go
+    /// missing" without the event channel having to deliver anything -- the
+    /// stamp is written by the firmware into a page the driver can just read.
+    /// LOG.md 32.41.81.
+    /// Host recovery gave up on this queue's in-flight work: complete it
+    /// with `error` so its clients stop waiting, but keep the command objects
+    /// alive (the firmware's channel still points at them; freeing them let a
+    /// later replay read reused memory), and refuse further submissions.
+    /// LOG.md 32.41.667zzz29.
+    pub(crate) fn abandon(&self, error: WorkError, ban: bool) -> usize {
+        let mut inner = self.inner.lock();
+        if ban {
+            inner.dead = true;
+        }
+        let mut cmds = KVec::new();
+        core::mem::swap(&mut inner.pending, &mut cmds);
+        inner.update_busy();
+        let n = cmds.len();
+        core::mem::drop(inner);
+        let mut keep = KVec::new();
+        for mut cmd in cmds {
+            cmd.as_mut().inner_mut().mark_error(error);
+            cmd.as_mut().inner_mut().complete();
+            if keep.push(cmd, GFP_KERNEL).is_err() {
+                pr_err!("WorkQueue: abandon: cannot retain a command (leaked)\n");
+            }
+        }
+        let mut inner = self.inner.lock();
+        for cmd in keep {
+            if let Err(e) = inner.zombies.push(cmd, GFP_KERNEL) {
+                // Better leaked than freed under the firmware.
+                core::mem::forget(e);
+            }
+        }
+        n
+    }
+
+    /// Whether `abandon` ran on this queue.
+    pub(crate) fn is_dead(&self) -> bool {
+        self.inner.lock().dead
+    }
+
+    /// Whether this queue has submitted work that has not completed.
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.inner.lock().pending.is_empty()
+    }
+
+    pub(crate) fn dump_state(&self, dev: &driver::AsahiDevice) {
+        let inner = self.inner.lock();
+        match inner.event.as_ref() {
+            Some(ev) => dev_err!(
+                dev.as_ref(),
+                "  WorkQueue({:?}): slot {} fw stamp {:#x} target {:#x} submitted {:#x} completed {:#x} doneptr {} rptr {} wptr {} commit_seq {} submit_seq {}\n",
+                inner.pipe_type,
+                ev.0.slot(),
+                ev.0.current().counter(),
+                ev.1.counter(),
+                inner.last_submitted.map(|v| v.counter()).unwrap_or(0),
+                inner.last_completed.map(|v| v.counter()).unwrap_or(0),
+                inner.doneptr(),
+                inner.rptr(),
+                inner.wptr(),
+                inner.commit_seq,
+                inner.submit_seq,
+            ),
+            None => dev_err!(
+                dev.as_ref(),
+                "  WorkQueue({:?}): no event slot bound; doneptr {} commit_seq {} submit_seq {}\n",
+                inner.pipe_type,
+                inner.doneptr(),
+                inner.commit_seq,
+                inner.submit_seq,
+            ),
+        }
     }
 }
 
@@ -587,6 +847,7 @@ impl<'a> Drop for JobSubmission::ver<'a> {
 
         let new_len = inner.pending.len() - self.command_count;
         inner.pending.truncate(new_len);
+        inner.update_busy();
 
         let pipe_type = inner.pipe_type;
         let event = inner.event.as_mut().expect("JobSubmission lost its event");
@@ -609,6 +870,19 @@ impl<'a> Drop for JobSubmission::ver<'a> {
 
 #[versions(AGX)]
 impl WorkQueueInner::ver {
+    /// Follow idle <-> busy transitions for the GPU usage statistics.
+    fn update_busy(&mut self) {
+        let busy = !self.pending.is_empty();
+        if busy != self.busy {
+            self.busy = busy;
+            if busy {
+                crate::stats::busy_begin();
+            } else {
+                crate::stats::busy_end();
+            }
+        }
+    }
+
     /// Return the number of free entries in the workqueue
     pub(crate) fn free_space(&self) -> usize {
         self.size as usize - self.pending.len() - 1
@@ -654,7 +928,7 @@ impl WorkQueue::ver {
             prio.5 = 1;
         }
 
-        let inner = WorkQueueInner::ver {
+        let mut inner = WorkQueueInner::ver {
             dev: dev.into(),
             event_manager,
             // Use shared (coherent) state with verbose faults so we can dump state correctly
@@ -702,8 +976,19 @@ impl WorkQueue::ver {
                         unk_94: 0,
                         pending: Default::default(),
                         unk_9c: 0,
+                        #[ver(V < V15_5)]
                         gpu_context: inner.gpu_context.gpu_pointer(),
+                        #[ver(V < V15_5)]
                         unk_a8: Default::default(),
+                        #[ver(V >= V15_5)]
+                        unk_a0: 0,
+                        #[ver(V >= V15_5)]
+                        gpu_context_15_5: {
+                            let p: u64 = inner.gpu_context.gpu_pointer().into();
+                            Array::new([p as u32, (p >> 32) as u32])
+                        },
+                        #[ver(V >= V15_5)]
+                        unk_ac: 0,
                         #[ver(V >= V13_2 && G < G14X)]
                         unk_b0: 0,
                     })
@@ -720,10 +1005,27 @@ impl WorkQueue::ver {
             pending_jobs: 0,
             commit_seq: 0,
             submit_seq: 0,
+            #[ver(V >= V15_5)]
+            dag_seq: 0,
             event_seq: 0,
             last_completed: None,
             last_submitted: None,
+            busy: false,
+            zombies: KVec::new(),
+            dead: false,
+            owner_pid: 0,
+            owner_comm: [0; 16],
         };
+        {
+            let task = kernel::current!();
+            let leader = task.group_leader();
+            inner.owner_pid = leader.pid();
+            // SAFETY: comm is a fixed 16-byte array in the live task_struct.
+            let comm = unsafe { (*leader.as_ptr()).comm };
+            for (d, c) in inner.owner_comm.iter_mut().zip(comm.iter()) {
+                *d = *c as u8;
+            }
+        }
 
         let info_pointer = inner.info.weak_pointer();
 
@@ -838,12 +1140,27 @@ pub(crate) trait WorkQueue {
     fn signal(&self) -> bool;
     fn mark_error(&self, value: event::EventValue, error: WorkError);
     fn fail_all(&self, error: WorkError);
+    /// Log which process owns this queue and what it has pending (timeouts).
+    fn describe(&self);
 }
 
 #[versions(AGX)]
 impl WorkQueue for WorkQueue::ver {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn describe(&self) {
+        let inner = self.inner.lock();
+        let n = inner.owner_comm.iter().position(|&c| c == 0).unwrap_or(16);
+        pr_err!(
+            "asahi:   slot owner: {:?} queue of pid {} ({}), {} job(s) / {} cmd(s) pending\n",
+            inner.pipe_type,
+            inner.owner_pid,
+            core::str::from_utf8(&inner.owner_comm[..n]).unwrap_or("?"),
+            inner.pending_jobs,
+            inner.pending.len()
+        );
     }
 
     /// Signal a workqueue that some work was completed.
@@ -930,6 +1247,7 @@ impl WorkQueue for WorkQueue::ver {
             .info
             .state
             .with(|raw, _inner| raw.cpu_freeptr.store(last_wptr, Ordering::Release));
+        inner.update_busy();
 
         let empty = inner.pending.is_empty();
         if empty && inner.pending_jobs == 0 {
@@ -965,12 +1283,25 @@ impl WorkQueue for WorkQueue::ver {
             value
         );
 
+        let mut failed = 0;
         for cmd in inner.pending.iter_mut() {
             if cmd.inner.value() <= value {
                 cmd.as_mut().inner_mut().mark_error(error);
+                failed += 1;
             } else {
                 break;
             }
+        }
+        if failed > 0 {
+            let n = inner.owner_comm.iter().position(|&c| c == 0).unwrap_or(16);
+            pr_err!(
+                "asahi: {:?} work of pid {} ({}) failed: {} job(s), {:?}\n",
+                inner.pipe_type,
+                inner.owner_pid,
+                core::str::from_utf8(&inner.owner_comm[..n]).unwrap_or("?"),
+                failed,
+                error
+            );
         }
     }
 
@@ -1000,6 +1331,7 @@ impl WorkQueue for WorkQueue::ver {
         let mut cmds = KVec::new();
 
         core::mem::swap(&mut inner.pending, &mut cmds);
+        inner.update_busy();
 
         if inner.pending_jobs == 0 {
             inner.event = None;
@@ -1010,6 +1342,16 @@ impl WorkQueue for WorkQueue::ver {
         for mut cmd in cmds {
             cmd.as_mut().inner_mut().mark_error(error);
             cmd.as_mut().inner_mut().complete();
+        }
+    }
+}
+
+#[versions(AGX)]
+impl Drop for WorkQueueInner::ver {
+    fn drop(&mut self) {
+        // A queue torn down with work pending (a killed client) stops counting.
+        if self.busy {
+            crate::stats::busy_end();
         }
     }
 }

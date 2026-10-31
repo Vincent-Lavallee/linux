@@ -240,9 +240,24 @@ pub(crate) mod raw {
         #[ver(G >= G14X)]
         pub(crate) registers: job::raw::RegisterArray,
 
+        // The register block is 0x720 bytes on G15X, not the 0x710 that
+        // `RegisterArray` describes. Three readings agree: the vertex start
+        // routine takes the microsequence from `[cmd+0x770]` (0x1ccd8), the
+        // selector at 0x1cf88 takes it from `[cmd+0x760]` for compute, and the
+        // timestamp pointer pair that routine walks sits 0x10 later than the
+        // driver had it. The extra 0x10 is carried here rather than inside
+        // `RegisterArray` because that type is not versioned and is reached
+        // through `GpuWeakPointer` from the microsequence. LOG.md 32.41.6.
+        #[ver(V >= V15_5)]
+        pub(crate) pad_regs_15_5: Array<0x10, u8>,
+
         pub(crate) job_params3: JobParameters3::ver,
         pub(crate) unk_758_flag: u32,
         pub(crate) unk_75c_flag: u32,
+        // 0x1c shorter on 15.5; same reasoning as RunVertex's padding.
+        #[ver(V >= V15_5)]
+        pub(crate) unk_buf: Array<0xf4, u8>,
+        #[ver(V < V15_5)]
         pub(crate) unk_buf: Array<0x110, u8>,
         pub(crate) busy_flag: u32,
         pub(crate) tvb_overflow_count: u32,
@@ -254,7 +269,7 @@ pub(crate) mod raw {
         pub(crate) unk_pointee: u32,
         #[ver(V >= V13_3)]
         pub(crate) unk_v13_3: u32,
-        pub(crate) meta: job::raw::JobMeta,
+        pub(crate) meta: job::raw::JobMeta::ver,
         pub(crate) unk_after_meta: u32,
         pub(crate) unk_buf_0: U64,
         pub(crate) unk_buf_8: U64,
@@ -270,10 +285,45 @@ pub(crate) mod raw {
         #[ver(V >= V13_0B4)]
         pub(crate) unk_ts: U64,
 
-        #[ver(V >= V13_0B4)]
+        #[ver(V >= V13_0B4 && V < V15_5)]
         pub(crate) unk_92d_8: Array<0x1b, u8>,
+
+        // 15.5 uses this run of bytes for the same tail block RunVertex and
+        // RunCompute carry: an unaligned UMA pool pointer, its flush flag 8
+        // bytes later, and a byte 0x19 after that.  The shared command start
+        // routine at fw:0x1d960 dispatches on the command tag at cmd+0 and, for
+        // tag 1 (RunFragment), reads them at cmd+0xc22 (fw:0x1dc18, x24 =
+        // cmd+0x8cc), cmd+0xc2a and cmd+0xc43.  LOG.md 32.41.33.
+        #[ver(V >= V15_5)]
+        pub(crate) unk_92d_8: Array<0x5, u8>,
+        #[ver(V >= V15_5)]
+        pub(crate) uma_pool: U64,
+        #[ver(V >= V15_5)]
+        pub(crate) uma_pool_flush: u8,
+        #[ver(V >= V15_5)]
+        pub(crate) unk_c2b: Array<0x19, u8>,
+
+        // 15.5's microsequence needs two things the pre-15.5 command has
+        // nowhere to put: a pool for `StartFragment + 0x1a8` to point at, and
+        // a *word holding that pool's address* for `FinalizeFragment + 0x90`,
+        // which the firmware dereferences twice (0x2518c does `ldr x21, [x20];
+        // ldr w8, [x21, #12]`).  Both live here, at the end of the command, so
+        // nothing before them moves.  LOG.md 32.41.26.
+        #[ver(V >= V15_5)]
+        pub(crate) pool_self: U64,
+        #[ver(V >= V15_5)]
+        pub(crate) pool: Array<0x90, u8>,
     }
 }
+
+// Pinned against the firmware: for command tag 1 the shared start routine reads
+// the UMA pool pointer at cmd+0xc22 (fw:0x1dc18), its flush flag at cmd+0xc2a
+// (fw:0x1dc20) and a byte at cmd+0xc43 (fw:0x1ddb0).  LOG.md 32.41.33.
+const _: () = {
+    assert!(core::mem::offset_of!(raw::RunFragmentG15XV15_5<'static>, uma_pool) == 0xc22);
+    assert!(core::mem::offset_of!(raw::RunFragmentG15XV15_5<'static>, uma_pool_flush) == 0xc2a);
+    assert!(core::mem::offset_of!(raw::RunFragmentG15XV15_5<'static>, pool_self) == 0xc44);
+};
 
 #[versions(AGX)]
 #[derive(Debug)]

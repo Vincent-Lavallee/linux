@@ -77,6 +77,15 @@ const DEBUG_CLASS: DebugFlags = DebugFlags::Object;
 pub(crate) struct GpuPointer<'a, T: ?Sized>(NonZeroU64, PhantomData<&'a T>);
 
 impl<'a, T: ?Sized> GpuPointer<'a, T> {
+    /// Create a GPU pointer from a raw GPU address.
+    ///
+    /// Needed for addresses that come from a fixed IOVA constant rather than an
+    /// allocation -- specifically the dual-mapped pass-page counter, whose two
+    /// addresses are `gpu::IOVA_KERN_GPU_PMCT_LOW`/`_HIGH`. LOG.md 32.41.508.
+    pub(crate) fn from_raw(addr: u64) -> Option<GpuPointer<'a, T>> {
+        NonZeroU64::new(addr).map(|v| GpuPointer(v, PhantomData))
+    }
+
     /// Logical OR the pointer with an arbitrary `u64`. This is used when GPU struct fields contain
     /// misc flag fields in the upper bits. The lifetime is retained. This is GPU-unsafe in
     /// principle, but we assert that only non-implemented address bits are touched, which is safe
@@ -191,6 +200,22 @@ impl<T: ?Sized> GpuWeakPointer<T> {
     // NOTE: The third argument is a type inference hack.
     pub(crate) unsafe fn offset<U>(&self, off: usize, _: *const U) -> GpuWeakPointer<U> {
         GpuWeakPointer::<U>(
+            NonZeroU64::new(self.0.get() + (off as u64)).unwrap(),
+            PhantomData,
+        )
+    }
+
+    /// Same as [`Self::offset`], but yields a slice-typed weak pointer.
+    ///
+    /// 15.5's channel slots keep a bare counter in the field earlier firmware
+    /// used for the ring pointer, so the driver has to put a `self + off`
+    /// pointer into a field declared as `GpuWeakPointer<[U]>`.
+    ///
+    /// # Safety
+    /// Same as [`Self::offset`]: the caller is responsible for the offset
+    /// landing inside the object this pointer refers to.
+    pub(crate) unsafe fn offset_slice<U>(&self, off: usize) -> GpuWeakPointer<[U]> {
+        GpuWeakPointer::<[U]>(
             NonZeroU64::new(self.0.get() + (off as u64)).unwrap(),
             PhantomData,
         )
@@ -518,11 +543,27 @@ unsafe impl<T: GpuStruct + Sync, U: Allocation<T>> Sync for GpuObject<T, U> {}
 /// objects around.
 pub(crate) trait OpaqueGpuObject: Send + Sync {
     fn gpu_va(&self) -> NonZeroU64;
+
+    /// The object's raw bytes, as the firmware sees them.
+    ///
+    /// Needed where a field has to be written at an offset the type system
+    /// cannot name -- see `WorkQueue::commit`, which stamps the ring position
+    /// into each 15.5 command at a per-command-type offset.
+    fn raw_bytes_mut(&mut self) -> &mut [u8];
 }
 
 impl<T: GpuStruct + Sync + Send, U: Allocation<T>> OpaqueGpuObject for GpuObject<T, U> {
     fn gpu_va(&self) -> NonZeroU64 {
         Self::gpu_va(self)
+    }
+
+    fn raw_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `self.raw` is valid for the lifetime of the object per the
+        // type invariant, and `&mut self` makes the borrow unique.
+        unsafe {
+            let len = core::mem::size_of_val(&*self.raw);
+            core::slice::from_raw_parts_mut(self.raw as *mut u8, len)
+        }
     }
 }
 

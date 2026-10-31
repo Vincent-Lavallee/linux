@@ -17,6 +17,10 @@ use kernel::{
         LockClassKey,
         Mutex, //
     },
+    time::{
+        delay::fsleep,
+        Delta, //
+    },
     uapi,
     xarray, //
 };
@@ -69,6 +73,45 @@ pub(crate) trait Queue: Send + Sync {
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result;
+}
+
+
+/// drm_asahi_cmd_compute.flags bit 0 (this fork): the command stream has a dispatch with more than
+/// 512 threads per workgroup. LOG.md 32.41.667zzz41.
+pub(crate) const COMPUTE_LARGE_WG: u32 = 1;
+
+/// .667zzz41 (`comp_serial` = K): the finished fences of the last K compute submissions (ring),
+/// so submission N depends on submission N-K: at most K compute jobs from all processes in flight.
+const COMP_SERIAL_MAX: usize = 16;
+/// .667zzz44: each entry carries the submitting queue's id -- a queue's own submissions are already
+/// ordered on the CDM, and waiting for them on the host put a ~2 ms bubble behind every large-WG
+/// submission of House of Ashes (GPU executing 60% of the time).
+struct CompSerialLast(
+    core::cell::UnsafeCell<([Option<(kernel::dma_fence::Fence, u64)>; COMP_SERIAL_MAX], usize)>,
+);
+// SAFETY: only accessed while COMP_SERIAL_BUSY is held.
+unsafe impl Sync for CompSerialLast {}
+static COMP_SERIAL_LAST: CompSerialLast =
+    CompSerialLast(core::cell::UnsafeCell::new(([const { None }; COMP_SERIAL_MAX], 0)));
+static COMP_SERIAL_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+struct CompSerialGuard;
+impl CompSerialGuard {
+    fn new() -> Self {
+        use core::sync::atomic::Ordering;
+        while COMP_SERIAL_BUSY
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            kernel::time::delay::fsleep(kernel::time::Delta::from_micros(20));
+        }
+        CompSerialGuard
+    }
+}
+impl Drop for CompSerialGuard {
+    fn drop(&mut self) {
+        COMP_SERIAL_BUSY.store(false, core::sync::atomic::Ordering::Release);
+    }
 }
 
 #[versions(AGX)]
@@ -142,6 +185,9 @@ pub(crate) struct QueueInner {
     id: u64,
     #[ver(V >= V13_0B4)]
     counter: AtomicU64,
+    /// comp_apple's compute UMA pool, built on the first compute job and kept for
+    /// the queue's lifetime. LOG.md 32.41.664.
+    cpool: Arc<Mutex<Option<Arc<fw::compute::ComputePool>>>>,
 }
 
 #[versions(AGX)]
@@ -182,6 +228,12 @@ impl dma_fence::FenceOps for JobFence::ver {
     }
 }
 
+/// Monotonic ns of the last host-initiated GPU restart (0 = none).
+static LAST_RESTART: AtomicU64 = AtomicU64::new(0);
+/// Lowest job id (= earliest submission) that timed out since that restart:
+/// the job everything else was waiting behind, i.e. the guilty one.
+static EPOCH_MIN_ID: AtomicU64 = AtomicU64::new(u64::MAX);
+
 #[versions(AGX)]
 pub(crate) struct QueueJob {
     dev: AsahiDevRef,
@@ -195,6 +247,10 @@ pub(crate) struct QueueJob {
     notification_count: u32,
     did_run: bool,
     id: u64,
+    /// The queue's TVB heap, grown when a render times out (host recovery).
+    buffer: Option<buffer::Buffer::ver>,
+    /// Host recoveries attempted for this job.
+    recoveries: u32,
 }
 
 #[versions(AGX)]
@@ -378,15 +434,105 @@ impl sched::JobImpl for QueueJob::ver {
             }
         }
 
-        // Now we fully commit to running the job
-        mod_dev_dbg!(job.dev, "QueueJob {}: Run fragment\n", job.id);
-        frag_sub.map(|a| gpu.run_job(a)).transpose()?;
+        // Now we fully commit to running the job.
+        //
+        // 🔑 The kick order matters on 15.5.  The firmware evaluates the
+        // fragment queue's `Barrier` the moment the fragment pipe is kicked;
+        // with the fragment kicked first the vertex has not run, the wait is
+        // unsatisfied, and the barrier parks *holding the event slot's
+        // in-flight refcount* (`fw:0xe4980 + slot*0x38 + 0x30`).  Every retry
+        // then hits `fw:0x13a1c`, which refuses any command on a slot whose
+        // refcount is non-zero, and logs trace id 0x54 with code 0x8b3 -- the
+        // barrier deadlocking against itself.  Observed directly:
+        //
+        //   0x0054 | 0 0     <frag wq> 0   OK    index 0 (Barrier)
+        //   0x0054 | 1 0x8b3 <frag wq> 0   FAIL  index 0, retried
+        //   0x0054 | 1 0x8b3 <frag wq> 0   FAIL  index 0, again
+        //   0x000a | 0x100 ...                   vertex completes -- too late
+        //
+        // `vtx_kick_first` reverses only the kicks, not the ring commits, so
+        // the barrier still precedes RunFragment in the queue.  `kick_delay_us`
+        // additionally gives the vertex time to retire first, which separates
+        // "the order is wrong" from "the barrier can never be re-evaluated".
+        // LOG.md 32.41.113.
+        if *crate::module_parameters::vtx_kick_first.value() != 0 {
+            mod_dev_dbg!(job.dev, "QueueJob {}: Run vertex (first)\n", job.id);
+            vtx_sub.map(|a| gpu.run_job(a)).transpose()?;
 
-        mod_dev_dbg!(job.dev, "QueueJob {}: Run vertex\n", job.id);
-        vtx_sub.map(|a| gpu.run_job(a)).transpose()?;
+            mod_dev_dbg!(job.dev, "QueueJob {}: Run compute\n", job.id);
+            comp_sub.map(|a| gpu.run_job(a)).transpose()?;
 
-        mod_dev_dbg!(job.dev, "QueueJob {}: Run compute\n", job.id);
-        comp_sub.map(|a| gpu.run_job(a)).transpose()?;
+            let delay = *crate::module_parameters::kick_delay_us.value();
+            if delay != 0 {
+                fsleep(Delta::from_micros(delay as i64));
+            }
+
+            mod_dev_dbg!(job.dev, "QueueJob {}: Run fragment (last)\n", job.id);
+            frag_sub.map(|a| gpu.run_job(a)).transpose()?;
+        } else {
+            mod_dev_dbg!(job.dev, "QueueJob {}: Run fragment\n", job.id);
+            frag_sub.map(|a| gpu.run_job(a)).transpose()?;
+
+            mod_dev_dbg!(job.dev, "QueueJob {}: Run vertex\n", job.id);
+            vtx_sub.map(|a| gpu.run_job(a)).transpose()?;
+
+            mod_dev_dbg!(job.dev, "QueueJob {}: Run compute\n", job.id);
+            comp_sub.map(|a| gpu.run_job(a)).transpose()?;
+        }
+
+        // 🔬 Probe the scene a fixed delay after the kick, still inside
+        // `run()`. The timeout probe stopped firing once the control-stream
+        // runaway was fixed (no fault -> no `handle_timeout`), and the drop
+        // probe never runs either: on a clean non-completion the CPU wedges in
+        // `Queue::drop` *before* `QueueJob::drop` (32.41.116). This is the one
+        // place guaranteed to execute while the job is in flight. A non-zero
+        // TVB tilemap here is direct evidence the vertex stage ran, which is
+        // what separates "the stream parses" from "the draw executed".
+        // LOG.md 32.41.176.
+        // 🔑 Non-perturbing in-flight state poll, started as early as this path
+        // allows -- before the `probe_delay_ms` sleep, so it covers the window
+        // right after the kick rather than one fixed instant well after it.
+        //
+        // This uses a BARE read of `0xc020`: it never writes the `0x10398`
+        // selector. That is the whole point. `state_in_flight` above goes
+        // through `dump_state_pre`, which writes the selector even though it
+        // restores it, and that measurably perturbs a run (32.41.336) -- so
+        // every reading it produced is suspect. Writing nothing cannot.
+        //
+        // What it is for: 32.41.327 concluded "the TA stage never starts" from
+        // `0xc020 = 0` sampled ~40 s after the kick, which is equally
+        // consistent with "started, did nothing, went idle" (32.41.346). A
+        // dense sample starting at the kick separates them. LOG.md 32.41.361.
+        let poll_n = *crate::module_parameters::state_poll_n.value();
+        if poll_n != 0 {
+            gpu.poll_state_now("inflight", poll_n, *crate::module_parameters::state_poll_ms.value());
+        }
+
+        let probe_ms = *crate::module_parameters::probe_delay_ms.value();
+        if probe_ms != 0 {
+            fsleep(Delta::from_millis(probe_ms as i64));
+            gpu.probe_scene("POSTKICK");
+            // 🔑 Sample the GPU state register *while the job is in flight*.
+            //
+            // 32.41.327 read `0xc020 = 0` at the hang and concluded the TA stage
+            // never starts -- but that sample is ~40 s after the kick, which is
+            // equally consistent with "ran, finished, went idle". Only a sample
+            // taken during the job separates the two.
+            //
+            // Uses `dump_state_pre`, which saves and restores the `0x10398`
+            // selector and touches two indices. That is NOT `dump_uma`'s 0..16
+            // sweep, which leaves the selector at 15 and measurably
+            // reintroduces the runaway (32.41.326). LOG.md 32.41.335.
+            if *crate::module_parameters::state_in_flight.value() != 0 {
+                gpu.dump_state_now("inflight");
+            }
+            // The firmware's vertex stats, in flight. This one is a kernel
+            // page-table read rather than MMIO, so it does not perturb the run
+            // the way the state sample above does (32.41.336) -- and it is the
+            // only way to see the stats on a CLEAN run, where no fault and no
+            // timeout means `handle_timeout` never fires. LOG.md 32.41.337.
+            gpu.dump_stats_now("inflight");
+        }
 
         mod_dev_dbg!(job.dev, "QueueJob {}: Drop compute job\n", job.id);
         core::mem::drop(comp_job);
@@ -407,6 +553,128 @@ impl sched::JobImpl for QueueJob::ver {
             "QueueJob {}: Job timed out on the DRM scheduler, things will probably break (ran: {})\n",
             job.id, job.did_run
         );
+
+        // This is the only place a stuck job is reachable. `Queue::drop` never
+        // runs while the process is still blocked on the fence, so the state
+        // that says *which* pipe is stuck and how far the firmware got has been
+        // going unread. LOG.md 32.41.98.
+        for sj in [job.sj_vtx.as_ref(), job.sj_frag.as_ref(), job.sj_comp.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            sj.wq.dump_state(&job.dev);
+            sj.wq.dump_info();
+            workqueue::WorkQueue::describe(&*sj.wq);
+        }
+        job.notifier.with(|raw, _inner| {
+            let vm_slot = raw.state.vm_slot;
+            let in_list = raw.state.in_list;
+            let has_vtx = raw.state.has_vtx;
+            let has_frag = raw.state.has_frag;
+            let pstamp_vtx = raw.state.pstamp_vtx[0].0;
+            let pstamp_frag = raw.state.pstamp_frag[0].0;
+            dev_err!(
+                job.dev.as_ref(),
+                "  Notifier: generation {:#x} cur_count {:#x} unk_10 {:#x} vm_slot {} in_list {} has_vtx {} pstamp_vtx {:#x} has_frag {} pstamp_frag {:#x}\n",
+                raw.generation.load(Ordering::Relaxed),
+                raw.cur_count.load(Ordering::Relaxed),
+                raw.unk_10.load(Ordering::Relaxed),
+                vm_slot,
+                in_list,
+                has_vtx,
+                pstamp_vtx,
+                has_frag,
+                pstamp_frag,
+            );
+        });
+        (*job.dev).gpu.dump_hung_state();
+        crate::channel::ktrace_hist_dump();
+
+        // Host recovery = Apple's channel restart: stop the firmware, resume
+        // it, and it re-dispatches every in-flight command. The known hang
+        // is a first frame bigger than the TVB heap (TA OOM, partial render
+        // never resumes the TA), so grow the heap first and the replay
+        // fits. Nothing is failed host-side (see host_recover). After three
+        // attempts on one job, give up. LOG.md 32.41.667zzz29.
+        if job.recoveries < 3 {
+            job.recoveries += 1;
+            if job.sj_vtx.is_some() {
+                if let Some(buf) = job.buffer.as_ref() {
+                    let cur = buf.block_count() as usize;
+                    match buf.ensure_blocks(cur * 4) {
+                        Ok(_) => {
+                            buf.force_publish();
+                            dev_err!(job.dev.as_ref(), "QueueJob {}: TVB heap {} -> {} blocks (published)\n",
+                                     job.id, cur, buf.block_count())
+                        }
+                        Err(e) => dev_err!(job.dev.as_ref(), "QueueJob {}: TVB grow failed: {:?}\n", job.id, e),
+                    }
+                }
+            }
+            // A job that was only queued behind the hung one times out right
+            // after it: the restart that just ran covers it too.
+            let now = crate::stats::now_ns();
+            let last = LAST_RESTART.load(Ordering::Acquire);
+            let recent = last != 0 && now.saturating_sub(last) < 15_000_000_000;
+            if recent {
+                EPOCH_MIN_ID.fetch_min(job.id, Ordering::AcqRel);
+            }
+            if recent || (*job.dev).gpu.host_recover() {
+                if !recent {
+                    LAST_RESTART.store(now, Ordering::Release);
+                    EPOCH_MIN_ID.store(job.id, Ordering::Release);
+                }
+                dev_err!(job.dev.as_ref(), "QueueJob {}: GPU restarted{} (attempt {}), job replayed\n",
+                         job.id, if recent { " (shared)" } else { "" }, job.recoveries);
+                // drm_sched does not re-arm a timeout for this job. The replay
+                // puts a still-hung command in a busy slot, where the
+                // firmware's own watchdog (Globals+0x9bc = 50 ticks, ~6.6 s)
+                // raises its Timeout event and the firmware-initiated
+                // recovery drops it cleanly (handle_timeout). Only if that
+                // never happens, abandon the work (fences complete with
+                // -ETIMEDOUT, command objects retained, queue banned).
+                let sjs = || {
+                    [job.sj_vtx.as_ref(), job.sj_frag.as_ref(), job.sj_comp.as_ref()]
+                        .into_iter()
+                        .flatten()
+                };
+                for _ in 0..15000 {
+                    if !sjs().any(|sj| sj.wq.has_pending()) {
+                        dev_err!(job.dev.as_ref(), "QueueJob {}: replay completed\n", job.id);
+                        return sched::Status::Nominal;
+                    }
+                    kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+                }
+                // The earliest-submitted job of this restart is the guilty one.
+                // A job that only waited behind it loses its channel too: its
+                // in-flight command never completes after the restart and
+                // every later one would time out again (.667zzz29 test 15),
+                // so ban both; robust clients recreate their context.
+                let guilty = job.id <= EPOCH_MIN_ID.load(Ordering::Acquire);
+                let n: usize = sjs()
+                    .map(|sj| sj.wq.abandon(workqueue::WorkError::Timeout, true))
+                    .sum();
+                // The firmware still holds the abandoned commands in its slots
+                // (its PM code dereferences them, fw:0x373a0): leak the work
+                // queues (which own them) and the TVB heap so process exit
+                // cannot free anything it may touch. Only after a hang.
+                for sj in sjs() {
+                    core::mem::forget(sj.wq.clone());
+                }
+                if let Some(b) = job.buffer.as_ref() {
+                    core::mem::forget(b.clone());
+                }
+                // ... and the VM: its slot stays bound and nothing is unmapped.
+                job.vm_bind.vm().poison();
+                // .667zzz40: leaked Scenes never release their UMA pool ids
+                crate::buffer::uma_busy_reset();
+                core::mem::forget(job.vm_bind.clone());
+                dev_err!(job.dev.as_ref(), "QueueJob {}: replay did not complete; abandoned {} commands{}\n",
+                         job.id, n, if guilty { ", queue lost (guilty)" } else { ", queue lost (innocent)" });
+                return sched::Status::Nominal;
+            }
+        }
+
         sched::Status::NoDevice
     }
 
@@ -416,6 +684,7 @@ impl sched::JobImpl for QueueJob::ver {
             "QueueJob {}: Job canceled on DRM scheduler teardown\n",
             job.id
         );
+        crate::channel::ktrace_hist_dump();
     }
 }
 
@@ -423,6 +692,20 @@ impl sched::JobImpl for QueueJob::ver {
 impl Drop for QueueJob::ver {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "QueueJob {}: Dropping\n", self.id);
+        // A job that completes cleanly, or one whose control stream now parses
+        // without running away, never reaches `handle_timeout` -- so the scene
+        // probe there stopped firing precisely when it became the thing worth
+        // reading. Probe again on the way out. LOG.md 32.41.174.
+        if *crate::module_parameters::probe_usc.value() != 0 {
+            if let Ok(gpu) = (*self.dev)
+                .gpu
+                .clone()
+                .arc_as_any()
+                .downcast::<gpu::GpuManager::ver>()
+            {
+                gpu.probe_scene("DROP");
+            }
+        }
     }
 }
 
@@ -444,6 +727,7 @@ impl Queue::ver {
         id: u64,
         priority: u32,
         usc_exec_base: u64,
+        uma: buffer::UmaSlot,
     ) -> Result<Queue::ver> {
         mod_dev_dbg!(dev, "[Queue {}] Creating queue\n", id);
 
@@ -457,8 +741,21 @@ impl Queue::ver {
 
         let threshold = alloc.shared.new_default::<fw::event::Threshold>()?;
 
+        // The notifier's `has_vtx`/`pstamp_*`/`in_list` bookkeeping is the only
+        // window on why a queue parked on a barrier is not being re-examined,
+        // and out of `alloc.private` (cached) every read of it from the CPU is
+        // stale -- all-zero for a job the firmware demonstrably has. Follow
+        // `WorkQueue`'s lead and move it to shared memory under
+        // `VerboseFaults` so the dump means something. LOG.md 32.41.107.
         let notifier: Arc<GpuObject<fw::event::Notifier::ver>> = Arc::new(
-            alloc.private.new_init(
+            if debug_enabled(DebugFlags::VerboseFaults)
+                || *crate::module_parameters::q_quarantine.value() & 4 != 0
+            {
+                &mut alloc.shared
+            } else {
+                &mut alloc.private
+            }
+            .new_init(
                 /*try_*/ init!(fw::event::Notifier::ver { threshold }),
                 |inner, _p| {
                     try_init!(fw::event::raw::Notifier::ver {
@@ -476,11 +773,18 @@ impl Queue::ver {
         // Priorities are handled by the AGX scheduler, there is no meaning within a
         // per-queue scheduler. Use a single run queue wth Kernel priority.
         let sched =
-            sched::Scheduler::new(dev.as_ref(), 1, WQ_SIZE, 0, 100000, c_str!("asahi_sched"))?;
+            sched::Scheduler::new(
+                dev.as_ref(),
+                1,
+                WQ_SIZE,
+                0,
+                (*module_parameters::job_timeout_ms.value()).max(1000),
+                c_str!("asahi_sched"),
+            )?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
 
         let buffer =
-            buffer::Buffer::ver::new(&*(*dev).gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
+            buffer::Buffer::ver::new(&*(*dev).gpu, alloc, ualloc.clone(), ualloc_priv, mgr, uma)?;
 
         let mut ret = Queue::ver {
             dev: dev.into(),
@@ -506,6 +810,7 @@ impl Queue::ver {
                 id,
                 #[ver(V >= V13_0B4)]
                 counter: AtomicU64::new(0),
+                cpool: Arc::pin_init(kernel::new_mutex!(None), GFP_KERNEL)?,
             },
         };
 
@@ -640,6 +945,17 @@ impl Queue for Queue::ver {
             return Err(ENODEV);
         }
 
+        // A queue whose work was abandoned by host recovery is lost (as a
+        // guilty context is banned elsewhere): Mesa reports a lost context.
+        if [self.q_vtx.as_ref(), self.q_frag.as_ref(), self.q_comp.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|q| q.wq.is_dead())
+        {
+            dev_err!(self.dev.as_ref(), "[Submission {}] queue lost to a GPU hang, refusing\n", id);
+            return Err(ECANCELED);
+        }
+
         let op_guard = if in_sync_count > 0 {
             Some(gpu.start_op()?)
         } else {
@@ -695,8 +1011,13 @@ impl Queue for Queue::ver {
         let mut nr_render = 0;
         let mut nr_compute = 0;
 
+        let mut large_wg = false;
         while !cmdbuf.is_empty() {
             let header: uapi::drm_asahi_cmd_header = cmdbuf.read()?;
+            if header.cmd_type as u32 == uapi::drm_asahi_cmd_type_DRM_ASAHI_CMD_COMPUTE {
+                let c: uapi::drm_asahi_cmd_compute = cmdbuf.peek_up_to(header.size as usize)?;
+                large_wg |= c.flags & COMPUTE_LARGE_WG != 0;
+            }
             cmdbuf.skip(header.size as usize);
             nr_commands += 1;
 
@@ -733,6 +1054,8 @@ impl Queue for Queue::ver {
                     .map(|a| a.new_job(Fence::from_fence(&fence))),
                 fence,
                 notifier: self.inner.notifier.clone(),
+                buffer: Some(self.inner.buffer.clone()),
+                recoveries: 0,
 
                 // Each render command generates 2 notifications: 1 for the
                 // vertex part, 1 for the fragment part. Each compute command
@@ -756,6 +1079,26 @@ impl Queue for Queue::ver {
                 job.add_dependency(fence)?;
             }
         }
+        // .667zzz41: chain compute submissions across processes -- all of them (comp_serial = K,
+        // diagnostic) or only those with workgroups > 512 threads (large_wg_serial, default):
+        // two contexts each running workgroups larger than half a core deadlock the CDM.
+        let comp_serial = nr_compute > 0
+            && (*crate::module_parameters::comp_serial.value() != 0
+                || (large_wg && *crate::module_parameters::large_wg_serial.value() != 0));
+        let _comp_serial_guard = if comp_serial {
+            let g = CompSerialGuard::new();
+            // SAFETY: COMP_SERIAL_LAST is only touched while a CompSerialGuard is held.
+            let (ring, n) = unsafe { &*COMP_SERIAL_LAST.0.get() };
+            let k = (*crate::module_parameters::comp_serial.value() as usize).clamp(1, COMP_SERIAL_MAX);
+            if let Some((prev, owner)) = ring[*n % k].clone() {
+                if owner != self.inner.id || *crate::module_parameters::comp_serial.value() != 0 {
+                    job.add_dependency(prev)?;
+                }
+            }
+            Some(g)
+        } else {
+            None
+        };
 
         // Validate the number of hardware commands, ignoring software commands
         let nr_hw_commands = nr_render + nr_compute;
@@ -800,22 +1143,84 @@ impl Queue for Queue::ver {
                     };
                     mod_dev_dbg!(self.dev, "[Submission {}] Create Explicit Barrier\n", id);
                     let barrier = alloc.private.new_init(
-                        pin_init::zeroed::<fw::workqueue::Barrier>(),
+                        pin_init::zeroed::<fw::workqueue::Barrier::ver>(),
                         |_inner, _p| {
                             let queue_job = &queue_job;
-                            try_init!(fw::workqueue::raw::Barrier {
+                            try_init!(fw::workqueue::raw::Barrier::ver {
                                 tag: fw::workqueue::CommandType::Barrier,
                                 wait_stamp: event.fw_stamp_pointer,
+                                #[ver(V < V15_5)]
                                 wait_value: event.value,
+                                #[ver(V < V15_5)]
                                 wait_slot: event.slot,
+                                #[ver(V < V15_5)]
                                 stamp_self: queue_job.event_info().value.next(),
+                                #[ver(V < V15_5)]
                                 uuid: 0xffffbbbb,
+                                #[ver(V < V15_5)]
                                 external_barrier: 0,
+                                #[ver(V < V15_5)]
                                 internal_barrier_type: 1,
+                                #[ver(V < V15_5)]
+                                padding: Default::default(),
+                                #[ver(V >= V15_5)]
+                                wait_stamp2: U64(0),
+                                #[ver(V >= V15_5)]
+                                wait_value: event.value,
+                                #[ver(V >= V15_5)]
+                                wait_value64: U64(0),
+                                // 32.41.664: +0x20 low byte = the AWAITED stamp slot
+                                // (fw:0x193b8: 0x80 = none, else root 0xe4980 + slot *
+                                // 0x38; the dependency is linked to that slot's DAG node
+                                // for wait_value's entry). 0 linked glmark2's wait on the
+                                // fragment stamp (slot 1) to the vertex slot's finished
+                                // node -> frame 3 never started.
+                                #[ver(V >= V15_5)]
+                                barrier_type: if *crate::module_parameters::barrier_dag.value() != 0 {
+                                    event.slot
+                                } else {
+                                    0
+                                },
+                                // 32.41.664: +0x24 is the DAG word the barrier ASSIGNS
+                                // to this queue's stamp-slot counter (fw:0x19308 ->
+                                // 0x19bb0), so it must be the next command's stamp, as
+                                // the render path's internal barrier already does. The
+                                // awaited slot (<< 8) reset the vertex counter to 1 and
+                                // glmark2's 2nd RunVertex (entry 2) hit "DAG: Non
+                                // Sequential Stamp Updates".
+                                #[ver(V >= V15_5)]
+                                flags_slot: if *crate::module_parameters::barrier_dag.value() != 0 {
+                                    queue_job.event_info().value.next().counter()
+                                } else {
+                                    event.slot << 8
+                                },
+                                #[ver(V >= V15_5)]
+                                stamp_self: queue_job.event_info().value.next(),
+                                #[ver(V >= V15_5)]
+                                uuid: 0xffffbbbb,
+                                #[ver(V >= V15_5)]
+                                armed: if *crate::module_parameters::xbarrier_armed.value() != 0 {
+                                    1
+                                } else {
+                                    *crate::module_parameters::barrier_armed.value()
+                                },
+                                #[ver(V >= V15_5)]
+                                unk_34: 0,
+                                #[ver(V >= V15_5)]
                                 padding: Default::default(),
                             })
                         },
                     )?;
+                    crate::sub_pr_info!(
+                        "asahi/xbarrier: cmd {} type {} q{} index {} awaits slot {} value {:#x} -> own next {:#x}\n",
+                        command_index,
+                        header.cmd_type,
+                        queue_idx,
+                        index,
+                        event.slot,
+                        event.value.counter(),
+                        queue_job.event_info().value.next().counter()
+                    );
                     mod_dev_dbg!(self.dev, "[Submission {}] Add Explicit Barrier\n", id);
                     queue_job.add(barrier, vm_slot)?;
                 } else {
@@ -900,6 +1305,13 @@ impl Queue for Queue::ver {
         mod_dev_dbg!(self.dev, "Queue {}: Arming job {}\n", self.inner.id, job.id);
         let mut job = job.arm();
         let out_fence = job.fences().finished();
+        if comp_serial {
+            // SAFETY: the CompSerialGuard is held until the end of submit().
+            let (ring, n) = unsafe { &mut *COMP_SERIAL_LAST.0.get() };
+            let k = (*crate::module_parameters::comp_serial.value() as usize).clamp(1, COMP_SERIAL_MAX);
+            ring[*n % k] = Some((out_fence.clone(), self.inner.id));
+            *n = n.wrapping_add(1);
+        }
         mod_dev_dbg!(
             self.dev,
             "Queue {}: Pushing job {}\n",
@@ -931,5 +1343,103 @@ impl Queue for Queue::ver {
 impl Drop for Queue::ver {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "[Queue {}] Dropping queue\n", self.inner.id);
+        let qq = *crate::module_parameters::q_quarantine.value();
+        // 667zzf: firmware list nodes of this queue, to match against a later
+        // firmware fault (q_quarantine bit 3).
+        if qq & 8 != 0 {
+            pr_info!(
+                "asahi/qlife: drop queue {} notifier {:#x} notifier_list {:#x}\n",
+                self.inner.id,
+                u64::from(self.inner.notifier.weak_pointer()),
+                u64::from(self.inner.notifier_list.weak_pointer())
+            );
+            for (n, q) in [("vtx", self.q_vtx.as_ref()), ("frag", self.q_frag.as_ref()), ("comp", self.q_comp.as_ref())] {
+                if let Some(q) = q {
+                    pr_info!(
+                        "asahi/qlife: drop queue {} {} info {:#x} ctx {:#x}\n",
+                        self.inner.id,
+                        n,
+                        u64::from(q.wq.info_pointer()),
+                        u64::from(self.inner.gpu_context.gpu_pointer())
+                    );
+                }
+            }
+        }
+        // 667zzf diagnostics (q_quarantine): bit 2 reads the notifier the way
+        // the firmware sees it (shared). Measured: cur_count == threshold and
+        // in_list 0 on every drop -- notifiers are unlinked in time; the reuse
+        // corruption was the misnumbered 15.5 DestroyContext (32.41.667zzg).
+        // Bits 0/1 leak the queue's firmware objects instead of freeing them.
+        if qq & 4 != 0 {
+            // shared (uncached) notifier: these reads are the firmware's view
+            let thr = self.inner.notifier.threshold.with(|raw, _inner| raw.0.load(Ordering::Relaxed));
+            self.inner.notifier.with(|raw, _inner| {
+                let in_list = raw.state.in_list;
+                pr_info!(
+                    "asahi/qlife: drop queue {} cur_count {:#x} threshold {:#x} in_list {} gen {:#x}\n",
+                    self.inner.id,
+                    raw.cur_count.load(Ordering::Relaxed),
+                    thr,
+                    in_list,
+                    raw.generation.load(Ordering::Relaxed)
+                );
+            });
+        }
+        if qq & 1 != 0 {
+            core::mem::forget(self.inner.notifier.clone());
+            core::mem::forget(self.inner.notifier_list.clone());
+        }
+        if qq & 2 != 0 {
+            for q in [self.q_vtx.as_ref(), self.q_frag.as_ref(), self.q_comp.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                core::mem::forget(q.wq.clone());
+            }
+        }
+        // 667i: this dump runs on every GL context teardown and dump_hung_state
+        // reads scene buffers through raw pointers a previous scene may have
+        // freed (Oops in dump_scene_bufs) -> diagnostic only, off by default.
+        if *crate::module_parameters::drop_dump.value() == 0 {
+            return;
+        }
+        // Read the firmware's completion stamps on the way out. If they have
+        // advanced to the submitted value the work finished and only the
+        // notification is missing; if they have not, the job never ran.
+        // LOG.md 32.41.81.
+        for q in [self.q_vtx.as_ref(), self.q_frag.as_ref(), self.q_comp.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            q.wq.dump_state(&self.dev);
+            q.wq.dump_info();
+        }
+
+        // The notifier is what the firmware bumps as it makes progress through
+        // a job; `cur_count` still at its submitted value with the stamps
+        // unmoved means the pass was entered and never left. LOG.md 32.41.89.
+        self.inner.notifier.with(|raw, _inner| {
+            let vm_slot = raw.state.vm_slot;
+            let in_list = raw.state.in_list;
+            let has_vtx = raw.state.has_vtx;
+            let has_frag = raw.state.has_frag;
+            let pstamp_vtx = raw.state.pstamp_vtx[0].0;
+            let pstamp_frag = raw.state.pstamp_frag[0].0;
+            dev_err!(
+                self.dev.as_ref(),
+                "  Notifier: generation {:#x} cur_count {:#x} unk_10 {:#x} vm_slot {} in_list {} has_vtx {} pstamp_vtx {:#x} has_frag {} pstamp_frag {:#x}\n",
+                raw.generation.load(Ordering::Relaxed),
+                raw.cur_count.load(Ordering::Relaxed),
+                raw.unk_10.load(Ordering::Relaxed),
+                vm_slot,
+                in_list,
+                has_vtx,
+                pstamp_vtx,
+                has_frag,
+                pstamp_frag,
+            );
+        });
+
+        (*self.dev).gpu.dump_hung_state();
     }
 }

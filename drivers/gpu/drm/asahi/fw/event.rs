@@ -34,16 +34,16 @@ pub(crate) mod raw {
         unk_14: u32,
         unk_18: U64,
         unk_20: u32,
-        vm_slot: u32,
-        has_vtx: u32,
-        pstamp_vtx: Array<4, U64>,
-        has_frag: u32,
-        pstamp_frag: Array<4, U64>,
-        has_comp: u32,
-        pstamp_comp: Array<4, U64>,
+        pub(crate) vm_slot: u32,
+        pub(crate) has_vtx: u32,
+        pub(crate) pstamp_vtx: Array<4, U64>,
+        pub(crate) has_frag: u32,
+        pub(crate) pstamp_frag: Array<4, U64>,
+        pub(crate) has_comp: u32,
+        pub(crate) pstamp_comp: Array<4, U64>,
         #[ver(G >= G14 && V < V13_0B4)]
         unk_98_g14_0: Array<0x14, u8>,
-        in_list: u32,
+        pub(crate) in_list: u32,
         list_head: LinkedListHead,
         #[ver(G >= G14 && V < V13_0B4)]
         unk_a8_g14_0: Pad<4>,
@@ -65,7 +65,7 @@ pub(crate) mod raw {
 
     #[derive(Debug)]
     #[repr(transparent)]
-    pub(crate) struct Threshold(AtomicU64);
+    pub(crate) struct Threshold(pub(crate) AtomicU64);
     default_zeroed!(Threshold);
 
     impl Threshold {

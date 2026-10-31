@@ -123,6 +123,17 @@ impl<'a> Reader<'a> {
         Ok(obj)
     }
 
+    /// Like `read_up_to`, without advancing.
+    pub(crate) fn peek_up_to<T: AnyBitPattern>(&self, max_size: usize) -> Result<T> {
+        let mut obj: T = Default::default();
+        let size: usize = core::mem::size_of::<T>().min(max_size);
+        let src = self.buffer.get(self.offset..self.offset + size).ok_or(EINVAL)?;
+        // SAFETY: as in read_up_to.
+        let dst = unsafe { core::slice::from_raw_parts_mut(&mut obj as *mut _ as *mut u8, size) };
+        dst.copy_from_slice(src);
+        Ok(obj)
+    }
+
     pub(crate) fn read<T: Default + AnyBitPattern>(&mut self) -> Result<T> {
         self.read_up_to(!0)
     }

@@ -13,6 +13,7 @@ const MAX_POWERZONES: usize = 5;
 
 pub(crate) mod t600x;
 pub(crate) mod t602x;
+pub(crate) mod t6030;
 pub(crate) mod t8103;
 pub(crate) mod t8112;
 
@@ -22,6 +23,7 @@ pub(crate) mod t8112;
 pub(crate) enum GpuGen {
     G13 = 13,
     G14 = 14,
+    G15 = 15,
 }
 
 /// GPU variant enumeration. Note: Part of the UABI.
@@ -70,6 +72,14 @@ pub(crate) enum GpuCore {
     G14S = 16,
     G14C = 17,
     G14D = 18, // Split out, unlike G13D
+    // G15P = 19,
+    // G15G = 20,
+    /// M3 Pro. NOTE: unverified. The G13/G14 series runs P,G,S,C(,D) at
+    /// 10..18, which would put G15S at 21, but m1n1 has been sending 20 and the
+    /// firmware accepts the resulting InitData. Neither is proven -- the value
+    /// the hardware reports could not be read, because the G15 SGX ID register
+    /// offsets are not the t8103/t602x ones (they read back as zero).
+    G15S = 20,
 }
 
 /// GPU revision ID. Note: Part of the firmware ABI.
@@ -518,6 +528,28 @@ impl PwrConfig {
     /// Load the GPU power configuration from the device tree.
     pub(crate) fn load(dev: &AsahiDevice, cfg: &HwConfig) -> Result<PwrConfig> {
         let perf_states = Self::load_opp(dev, c_str!("operating-points-v2"), cfg, true)?;
+
+        // The firmware hangs in `AGFHALWaitForPerfState` polling `0xd4c004` for
+        // a state index it never reaches (`expected:0xb got:0x1b`,
+        // `expected:0xd got:0x1d` -- always the wanted index with bit 4 set).
+        // The index comes from this table, and the .dtsi that ships it carries
+        // hand-written placeholders (every `opp-microvolt` and `opp-microwatt`
+        // zero, `opp10` a uniqueness hack at 1182000001, `opp12` *below*
+        // `opp11`), which m1n1 is supposed to overwrite from the live ADT --
+        // the bundle ADT's own `perf-states` are all-zero, so iBoot fills them.
+        // Print what actually got loaded so that can be checked rather than
+        // assumed. LOG.md 32.41.110.
+        for (i, ps) in perf_states.iter().enumerate() {
+            dev_info!(
+                dev.as_ref(),
+                "asahi/pstate[{}]: {} Hz, {} mW, volt {:?}\n",
+                i,
+                ps.freq_hz,
+                ps.pwr_mw,
+                ps.volt_mv,
+            );
+        }
+
         let node = dev.as_ref().of_node().ok_or(EIO)?;
 
         macro_rules! prop {
@@ -581,7 +613,24 @@ impl PwrConfig {
             None
         };
 
-        let power_sample_period: u32 = prop!("apple,power-sample-period");
+        let adt_sample_period: u32 = prop!("apple,power-sample-period");
+        let adt_aic_clks: u32 = prop!(
+            "apple,pwr-sample-period-aic-clks",
+            cfg.base_clock_hz / 1000 * adt_sample_period
+        );
+        // pm_period_ms: the PM thread's tick (0x0228, 0x30d40 clocks = 8 ms on
+        // t6030) is the only thing that wakes a GPU the firmware parked
+        // between jobs, so it bounds the per-submission stall. LOG.md 32.41.667zz.
+        let pm_ov = *crate::module_parameters::pm_period_ms.value();
+        let (power_sample_period, pwr_sample_period_aic_clks) = if pm_ov != 0 && adt_sample_period != 0 {
+            (pm_ov, adt_aic_clks / adt_sample_period * pm_ov)
+        } else {
+            (adt_sample_period, adt_aic_clks)
+        };
+        // pm_period_clks: the tick alone, below 1 ms (the ms value above
+        // still feeds the filter math and must stay >= 1).
+        let pm_clks = *crate::module_parameters::pm_period_clks.value();
+        let pwr_sample_period_aic_clks = if pm_clks != 0 { pm_clks } else { pwr_sample_period_aic_clks };
 
         Ok(PwrConfig {
             core_leak_coef,
@@ -591,8 +640,22 @@ impl PwrConfig {
             max_freq_mhz: perf_states.iter().map(|a| a.freq_hz).max().unwrap() / 1_000_000,
 
             perf_base_pstate: prop!("apple,perf-base-pstate", 1),
-            perf_max_pstate: perf_states.len() as u32 - 1,
-            min_sram_microvolt: prop!("apple,min-sram-microvolt"),
+            // The firmware hangs polling `0xd4c004` for exactly the top of
+            // this table -- `expected:0xd` is pstate 13, `expected:0xb` is 11 --
+            // and the hardware never clears bit 4 of the reply. Clamping the
+            // maximum keeps the firmware off the states it cannot reach, and
+            // tells us whether the top pstates are the problem or the DVFS
+            // path as a whole is. LOG.md 32.41.111.
+            perf_max_pstate: match *crate::module_parameters::max_pstate.value() {
+                0 => perf_states.len() as u32 - 1,
+                v => v.min(perf_states.len() as u32 - 1),
+            },
+            // .594: `min_sram_uv` overrides the dtsi guess (790000). The live ADT
+            // `perf-states-sram` floors the SRAM rail at 810 mV (states 0-5).
+            min_sram_microvolt: match *crate::module_parameters::min_sram_uv.value() {
+                0 => prop!("apple,min-sram-microvolt"),
+                v => v,
+            },
 
             avg_power_filter_tc_ms: prop!("apple,avg-power-filter-tc-ms"),
             avg_power_ki_only: prop!("apple,avg-power-ki-only"),
@@ -631,10 +694,7 @@ impl PwrConfig {
             pwr_integral_min_clamp: prop!("apple,pwr-integral-min-clamp", 0),
             pwr_min_duty_cycle: prop!("apple,pwr-min-duty-cycle"),
             pwr_proportional_gain: prop!("apple,pwr-proportional-gain", f32!(5.2831855)),
-            pwr_sample_period_aic_clks: prop!(
-                "apple,pwr-sample-period-aic-clks",
-                cfg.base_clock_hz / 1000 * power_sample_period
-            ),
+            pwr_sample_period_aic_clks,
             se_engagement_criteria: prop!("apple,se-engagement-criteria", -1),
             se_filter_time_constant: prop!("apple,se-filter-time-constant", 9),
             se_filter_time_constant_1: prop!("apple,se-filter-time-constant-1", 3),

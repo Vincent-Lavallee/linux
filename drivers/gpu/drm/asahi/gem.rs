@@ -51,6 +51,8 @@ pub(crate) struct AsahiObject {
     exportable: bool,
     /// Whether this is a kernel-created object.
     kernel: bool,
+    /// Counts the object in the GPU memory statistics (`stats.rs`).
+    _acct: crate::stats::MemAcct,
 }
 
 /// Type alias for the shmem GEM object type for this driver.
@@ -214,7 +216,7 @@ impl DriverObject for AsahiObject {
     const HAS_EXPORT: bool = true;
 
     /// Callback to create the inner data of a GEM object
-    fn new(_dev: &AsahiDevice, _size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
+    fn new(_dev: &AsahiDevice, size: usize, args: Self::Args) -> impl PinInit<Self, Error> {
         let id = GEM_ID.fetch_add(1, Ordering::Relaxed);
         mod_pr_debug!("AsahiObject::new id={}\n", id);
         try_pin_init!(AsahiObject {
@@ -222,6 +224,7 @@ impl DriverObject for AsahiObject {
             flags: args.flags,
             exportable: args.exportable,
             kernel: args.kernel,
+            _acct: crate::stats::MemAcct::new(size),
         })
     }
 
