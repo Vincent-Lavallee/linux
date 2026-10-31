@@ -554,8 +554,16 @@ enum drm_asahi_priority {
  * struct drm_asahi_queue_create - Arguments passed to
  * DRM_IOCTL_ASAHI_QUEUE_CREATE
  */
+/**
+ * DRM_ASAHI_QUEUE_G15: the client emits G15 (AGX3) shaders and command
+ * streams. On G15 GPUs a queue without it is refused: G13/G14 code crashes the
+ * G15 firmware and takes every client down with it (e.g. a stock Mesa inside
+ * a muvm guest). Module parameter allow_foreign_clients=1 lifts the check.
+ */
+#define DRM_ASAHI_QUEUE_G15 (1U << 0)
+
 struct drm_asahi_queue_create {
-	/** @flags: MBZ */
+	/** @flags: DRM_ASAHI_QUEUE_G15 or 0 */
 	__u32 flags;
 
 	/** @vm_id: The ID of the VM this queue is bound to */

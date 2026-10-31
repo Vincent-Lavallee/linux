@@ -120,6 +120,8 @@ struct SlotAllocatorInner<T: SlotItem> {
     get_count: u64,
     drop_count: u64,
     slot_limit: usize,
+    /// Lowest slot handed out (32.41.630: buffer slot 0 may be a firmware sentinel).
+    slot_min: usize,
 }
 
 /// A single slot allocator instance.
@@ -169,6 +171,7 @@ impl<T: SlotItem> SlotAllocator<T> {
             get_count: 0,
             drop_count: 0,
             slot_limit: usize::MAX,
+            slot_min: 0,
         };
 
         let alloc = Arc::pin_init(
@@ -195,6 +198,11 @@ impl<T: SlotItem> SlotAllocator<T> {
     pub(crate) fn set_limit(&self, limit: Option<NonZeroUsize>) {
         let mut inner = self.0.inner.lock();
         inner.slot_limit = limit.unwrap_or(NonZeroUsize::MAX).get();
+    }
+
+    /// Never hand out slots below `min`.
+    pub(crate) fn set_min(&self, min: usize) {
+        self.0.inner.lock().slot_min = min;
     }
 
     /// Gets a fresh slot, optionally reusing a previous allocation if a `SlotToken` is provided.
@@ -246,6 +254,9 @@ impl<T: SlotItem> SlotAllocator<T> {
             for (i, slot) in inner.slots.iter().enumerate() {
                 if i >= inner.slot_limit {
                     break;
+                }
+                if i < inner.slot_min {
+                    continue;
                 }
                 if let Some(slot) = slot.as_ref() {
                     if slot.drop_time < oldest_time {

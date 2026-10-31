@@ -15,6 +15,12 @@ use crate::{
 pub(crate) mod raw {
     use super::*;
 
+    /// 15.5 doubled this from 16 to 32 bytes: it carries **two** state/ring
+    /// pairs, not one. Read off the FWLog entry (RegionB+0x1d8) in the running
+    /// firmware -- slots 0/2 are dereferenced as channel state (READ_PTR at +0,
+    /// WRITE_PTR at +0x20) and slots 1/3 as rings indexed `<<6`. The firmware
+    /// produces into **pair 2**, which is why m1n1 saw nothing until it looked
+    /// there. See m3-gpu-display/LOG.md 9.6 and 17.1.
     #[derive(Debug, Default)]
     #[repr(C)]
     pub(crate) struct ChannelRing<T: GpuStruct + Debug + Default, U: Copy> {
@@ -22,13 +28,102 @@ pub(crate) mod raw {
         pub(crate) ring: Option<GpuWeakPointer<[U]>>,
     }
 
+    /// The firmware-facing channel slot.
+    ///
+    /// 13.5 and earlier: exactly a `ChannelRing`, 16 bytes.
+    /// 15.5: 32 bytes, four pointer-sized fields. Their meaning depends on
+    /// which way the channel runs, so build one with [`ChannelSlot::new_tx`] or
+    /// [`ChannelSlot::new_rx`] rather than filling it in by hand.
+    ///
+    /// Kept separate from `ChannelRing` so the generic channel plumbing in
+    /// channel.rs stays version-agnostic.
+    #[versions(AGX)]
+    #[derive(Debug, Default)]
+    #[repr(C)]
+    pub(crate) struct ChannelSlot<T: GpuStruct + Debug + Default, U: Copy> {
+        pub(crate) pair1: ChannelRing<T, U>,
+
+        #[ver(V >= V15_5)]
+        pub(crate) pair2: ChannelRing<T, U>,
+    }
+
+    #[versions(AGX)]
+    impl<T: GpuStruct + Debug + Default, U: Copy> ChannelSlot::ver<T, U> {
+        /// Build a slot for a channel the **firmware** produces into: event,
+        /// fwlog, ktrace, stats.
+        ///
+        /// The firmware reads the second pair's state as a whole `ChannelState`
+        /// (read_ptr +0, write_ptr +0x20) and the second ring as the message
+        /// buffer -- see the event producer at 0x30a54, which indexes
+        /// `*(slot+0x10)` by `sub * 0x30` and then reads +0x20. Pointing both
+        /// pairs at the ring the driver owns is therefore already right.
+        /// LOG.md 9.6, 17.1.
+        pub(crate) fn new_rx(r: ChannelRing<T, U>) -> Self {
+            Self {
+                #[ver(V >= V15_5)]
+                pair2: ChannelRing {
+                    state: r.state,
+                    ring: r.ring,
+                },
+                pair1: r,
+            }
+        }
+
+        /// Build a slot for a channel the **driver** produces into: the twelve
+        /// pipe slots and device control.
+        ///
+        /// 15.5 does not read these as two `ChannelRing`s at all. It takes three
+        /// pointers to bare `u32` counters plus the ring base:
+        ///
+        /// ```text
+        ///   +0x00 -> read_ptr    firmware bumps it as it consumes   (0x32d48)
+        ///   +0x08 -> read_ack    firmware stores the drained wptr   (0x32d1c)
+        ///   +0x10 -> write_ptr   compared against +0x00 for work    (0x61f0)
+        ///   +0x18 -> ring base   entry = ring + idx * sizeof(msg)   (0x32d6c)
+        /// ```
+        ///
+        /// Aliasing the two pairs -- which is what reading the slot as two
+        /// `ChannelRing`s produces -- puts the *read* pointer in the write
+        /// pointer's slot. `*(+0x00)` and `*(+0x10)` then dereference to the
+        /// same `u32`, the comparison at 0x61f0 never differs, and the firmware
+        /// concludes every ring is permanently empty. That is exactly the
+        /// observed "fw rptr stays 0 while our wptr climbs", and it is why *no*
+        /// channel worked -- device control timed out the same way. LOG.md 32.
+        pub(crate) fn new_tx(r: ChannelRing<T, U>) -> Self {
+            Self {
+                #[ver(V >= V15_5)]
+                pair2: ChannelRing {
+                    // SAFETY: T is a ChannelState, whose write_ptr sits at
+                    // +0x20 (see raw::ChannelState), so this stays inside the
+                    // object `r.state` points at.
+                    state: r
+                        .state
+                        .map(|s| unsafe { s.offset(0x20, core::ptr::null::<T>()) }),
+                    ring: r.ring,
+                },
+                pair1: ChannelRing {
+                    state: r.state,
+                    // The read-ack counter. +0x04 is inside the padding between
+                    // read_ptr and write_ptr, which nothing else uses, so the
+                    // firmware's store lands somewhere harmless and stays in the
+                    // object the other two pointers already refer to.
+                    // SAFETY: as above.
+                    #[ver(V >= V15_5)]
+                    ring: r.state.map(|s| unsafe { s.offset_slice(0x4) }),
+                    #[ver(V < V15_5)]
+                    ring: r.ring,
+                },
+            }
+        }
+    }
+
     #[versions(AGX)]
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct PipeChannels {
-        pub(crate) vtx: ChannelRing<channels::ChannelState, channels::PipeMsg::ver>,
-        pub(crate) frag: ChannelRing<channels::ChannelState, channels::PipeMsg::ver>,
-        pub(crate) comp: ChannelRing<channels::ChannelState, channels::PipeMsg::ver>,
+        pub(crate) vtx: ChannelSlot::ver<channels::ChannelState, channels::PipeMsg::ver>,
+        pub(crate) frag: ChannelSlot::ver<channels::ChannelState, channels::PipeMsg::ver>,
+        pub(crate) comp: ChannelSlot::ver<channels::ChannelState, channels::PipeMsg::ver>,
     }
     #[versions(AGX)]
     default_zeroed!(PipeChannels::ver);
@@ -586,20 +681,49 @@ pub(crate) mod raw {
         pub(crate) unk_3d34_0: Array<0x18, u8>,
 
         pub(crate) unk_3d34: Array<0x38, u8>,
+
+        // 15.5 reaches HwDataA through the unaligned pointer at RegionB+0x451
+        // and keeps its push-telemetry accounting inside it: 0x2ff8..0x5a50 is
+        // zeroed wholesale, the periodic tick's own state sits at 0x5a50 and
+        // its next deadline at 0x62a4. Whatever the exact tail of the 15.5
+        // struct is, the object has to be at least that big or the firmware
+        // writes past it. LOG.md 32.41.
+        #[ver(V >= V15_5)]
+        pub(crate) pad_15_5: Array<0x2800, u8>,
     }
     #[versions(AGX)]
     default_zeroed!(HwDataA::ver);
     #[versions(AGX)]
     no_debug!(HwDataA::ver);
 
+    /// 15.5 widened this from 32 to 40 bytes. From the running firmware's
+    /// io_mappings walker: `mov w12, #0x28` then
+    /// `umull x15, w14, w12` / `ldr x16, [HWDataB + idx*40 + 0x640]`, and the
+    /// fields it touches are entry+0/+8/+16/+24 (64-bit) and +32 (32-bit) --
+    /// i.e. total_size and element_size widened to u64 and readwrite shrank to
+    /// u32. See m3-gpu-display/LOG.md 12.2.
+    #[versions(AGX)]
     #[derive(Debug, Default, Clone, Copy)]
     #[repr(C)]
     pub(crate) struct IOMapping {
         pub(crate) phys_addr: U64,
         pub(crate) virt_addr: U64,
+
+        #[ver(V < V15_5)]
         pub(crate) total_size: u32,
+        #[ver(V < V15_5)]
         pub(crate) element_size: u32,
+        #[ver(V < V15_5)]
         pub(crate) readwrite: U64,
+
+        #[ver(V >= V15_5)]
+        pub(crate) total_size: U64,
+        #[ver(V >= V15_5)]
+        pub(crate) element_size: U64,
+        #[ver(V >= V15_5)]
+        pub(crate) readwrite: u32,
+        #[ver(V >= V15_5)]
+        pub(crate) pad_24: Pad<0x4>,
     }
 
     #[versions(AGX)]
@@ -616,9 +740,18 @@ pub(crate) mod raw {
         {
             0x18
         }
-        #[ver(V >= V13_5)]
+        #[ver(V >= V13_5 && V < V15_5)]
         {
             0x19
+        }
+        // 15.5: the firmware's own index table at 0xfffffc000005cea0 names 48
+        // register blocks and its highest io_mapping index is 54, so the array
+        // is 55 entries. The arithmetic closes exactly against the measured
+        // AGXHWDataB growth: 55*40 = 0x898, 0x640 + 0x898 = 0xed8, and
+        // sgx_sram_ptr sits at 0xee8, leaving 0x10 -- total 0x588. LOG.md 14.1.
+        #[ver(V >= V15_5)]
+        {
+            55
         }
     };
 
@@ -663,7 +796,18 @@ pub(crate) mod raw {
         pub(crate) yuv_matrices: Array<0x3f, Array<3, Array<4, i16>>>,
 
         pub(crate) pad_1c8: Pad<0x8>,
-        pub(crate) io_mappings: Array<IO_MAPPING_COUNT::ver, IOMapping>,
+        pub(crate) io_mappings: Array<IO_MAPPING_COUNT::ver, IOMapping::ver>,
+
+        // 15.5 layout of 0xed8..0x1000, from macOS's own stores
+        // (AGX{,Arm}Firmware::initFirmwareData, kext 0xfffffe00090dc598 /
+        // 0xfffffe00091010c8) and the firmware's consumers (direct read of
+        // +0xed8 at fw:0x2f9cc, bulk copy of 0xef0..0xfd8 at fw:0x2b638..):
+        // there is NO 0x10 pad after io_mappings -- sgx_sram_ptr is at 0xed8,
+        // base_clock_khz at 0xf20 -- but one extra u32 after
+        // power_sample_period (0xf28) and 0xc bytes before uat_ttb_base, so
+        // 0x1000 onwards is unchanged. With the old pad every field the
+        // firmware copied from here was 0x10/0xc bytes off (it read
+        // base_clock_khz = 0 and unk_4f4 = 0). LOG.md 32.41.539.
 
         #[ver(V >= V13_0B4)]
         pub(crate) sgx_sram_ptr: U64,
@@ -686,6 +830,8 @@ pub(crate) mod raw {
         pub(crate) unk_48c: u32,
         pub(crate) base_clock_khz: u32,
         pub(crate) power_sample_period: u32,
+        #[ver(V >= V15_5)]
+        pub(crate) unk_498_15_5: u32,
         pub(crate) pad_498: Pad<0x4>,
         pub(crate) unk_49c: u32,
         pub(crate) unk_4a0: u32,
@@ -741,6 +887,8 @@ pub(crate) mod raw {
         pub(crate) unk_54c: u32,
         pub(crate) unk_550: u32,
         pub(crate) unk_554: u32,
+        #[ver(V >= V15_5)]
+        pub(crate) unk_ff4_15_5: Array<3, u32>,
         pub(crate) uat_ttb_base: U64,
         pub(crate) gpu_core_id: u32,
         pub(crate) gpu_rev_id: u32,
@@ -790,9 +938,23 @@ pub(crate) mod raw {
         pub(crate) unk_ae4: Array<0x4, u32>,
         pub(crate) pad_af4: Pad<0x4>,
         pub(crate) unk_af8: u32,
+        #[ver(V < V15_5)]
         pub(crate) pad_afc: Pad<0x8>,
+        #[ver(V < V15_5)]
         pub(crate) unk_b04: u32,
+        #[ver(V < V15_5)]
         pub(crate) unk_b08: u32,
+        // 15.5: the shader-core enable mask, 3 x u32 at HwDataB+0x1c90. Both
+        // power-up paths (fw:0x31244, fw:0x37f44) read it as
+        //     ldr x8, [RegionB] ; ldr x9, [x8, #0x1c90] ; ldr x8, [x8, #0x1c98]
+        // and, only if non-zero, write it to Bumper+0xa0/a4/a8 and to
+        // DFenderMGPUCfg+0x1500/04/08 (= CORE_MASKS_G14X, SGX+0xe01500), which
+        // the USC pipe mask and the firmware cluster table are read from.
+        // Zero = the mask is never restored after a power gate. LOG.md 32.41.538.
+        #[ver(V >= V15_5)]
+        pub(crate) pad_afc: Pad<0x4>,
+        #[ver(V >= V15_5)]
+        pub(crate) core_masks_15_5: Array<3, u32>,
         pub(crate) unk_b0c: u32,
 
         #[ver(G >= G14X)]
@@ -905,7 +1067,25 @@ pub(crate) mod raw {
     #[derive(Debug)]
     #[repr(C)]
     pub(crate) struct RuntimeScratch {
+        #[ver(V < V15_5)]
         pub(crate) unk_280: Array<0x6800, u8>,
+
+        // 15.5 keeps an unaligned pointer at RegionB+0x451, inside what 13.5
+        // treats as one opaque blob. Three separate sites do
+        //     ldr x8, [RegionB_global] ; add x8, x8, #0x451 ; ldr x8, [x8]
+        // and then use the result as a struct base. Left at zero the firmware
+        // NULL-derefs with FAR = 0x8e8, which is the `str w9, [x8, #2280]` at
+        // 0x31d4 (LOG.md 14.2 and 30.5).
+        //
+        // Carved out of the blob so the surrounding size is unchanged.
+        // gpu_scratch sits at RegionB+0x398, so 0x451 is +0xb9 into it; U64 is
+        // packed(1) so the unaligned position needs no packing of this struct.
+        #[ver(V >= V15_5)]
+        pub(crate) unk_280a: Array<0xb9, u8>,
+        #[ver(V >= V15_5)]
+        pub(crate) unkptr_451: U64,
+        #[ver(V >= V15_5)]
+        pub(crate) unk_280b: Array<{ 0x6800 - 0xb9 - 8 }, u8>,
         pub(crate) unk_6a80: u32,
         pub(crate) gpu_idle: u32,
         pub(crate) unkpad_6a88: Pad<0x14>,
@@ -946,18 +1126,187 @@ pub(crate) mod raw {
     default_zeroed!(RuntimeScratch::ver);
 
     #[versions(AGX)]
+    #[ver(V >= V15_5)]
+    const _LAYOUT_HWDATAB_CORE_MASKS: () = {
+        assert!(core::mem::offset_of!(HwDataB::ver, core_masks_15_5) == 0x1c90);
+        assert!(core::mem::offset_of!(HwDataB::ver, io_mappings) == 0x640);
+        assert!(core::mem::offset_of!(HwDataB::ver, sgx_sram_ptr) == 0xed8);
+        assert!(core::mem::offset_of!(HwDataB::ver, chip_id) == 0xee0);
+        assert!(core::mem::offset_of!(HwDataB::ver, base_clock_khz) == 0xf20);
+        assert!(core::mem::offset_of!(HwDataB::ver, unk_49c) == 0xf30);
+        assert!(core::mem::offset_of!(HwDataB::ver, unk_4c0) == 0xf54);
+        assert!(core::mem::offset_of!(HwDataB::ver, unk_4e0) == 0xf74);
+        assert!(core::mem::offset_of!(HwDataB::ver, unk_4f4) == 0xf88);
+        assert!(core::mem::offset_of!(HwDataB::ver, uat_ttb_base) == 0x1000);
+        assert!(core::mem::size_of::<HwDataB::ver>() == 0x1e0c);
+    };
+
+    /// Layout check for the 15.5 RegionB port.
+    ///
+    /// The firmware reads `fault_info` at 0x2b8 (LOG.md 8.3). If the 0x18
+    /// header or the 32-byte ChannelSlot is wrong, everything below moves and
+    /// the firmware faults at run time instead of here.
+    ///
+    /// ⚠️ The two companion claims that used to be pinned here -- "hwdata_b at
+    /// 0x2c8, fwlog_ring2 at 0x2d8" -- were inferred from 13.5 spacing, never
+    /// measured. 0x2c8 and 0x2d8 are the *FW addresses of the two descriptor
+    /// tables* on 15.5; see the block comment on `buffer_mgr_ctl_gpu_addr_15_5`
+    /// and `_LAYOUT_REGIONB_TAIL`. LOG.md 32.41.73.
+    #[versions(AGX)]
+    #[ver(V >= V15_5)]
+    const _LAYOUT_RUNTIME_POINTERS: () = {
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, event_15_5) == 0x1b8);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, fw_log_15_5) == 0x1c8);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, ktrace_15_5) == 0x1d8);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, stats_15_5) == 0x1e8);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, fwlog_payload) == 0x1f8);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, fwlog_index) == 0x200);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, fwlog_overflow) == 0x220);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, events_enabled) == 0x240);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, pipe_tables) == 0x244);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, unkptr_190) == 0x2b8);
+        // The unaligned pointer the firmware reads as RegionB+0x451: 0x398 for
+        // gpu_scratch plus 0xb9 into the scratch blob. Getting this wrong is a
+        // run-time NULL deref in the firmware, so pin it here instead.
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, gpu_scratch) == 0x398);
+        assert!(core::mem::offset_of!(RuntimeScratch::ver, unkptr_451) == 0xb9);
+    };
+
+    #[versions(AGX)]
     #[repr(C)]
     pub(crate) struct RuntimePointers<'a> {
+        // 15.5 prepended a 0x18-byte header. Slot 0 is a second copy of the
+        // hwdata_b pointer -- proven, because the firmware dereferences
+        // RegionB+0 and reads the pstate tables through it.
+        //
+        // Slots 1 and 2 are pointers too, and both need real buffers. The
+        // earlier note here ("unidentified; no consumer touches them") was
+        // wrong -- it was written before the driver could get this far. Slot 2
+        // is dereferenced at 0x31790:
+        //     ldr x8, [RegionB_global] ; ldr x8, [x8, #16] ; ldr w9, [x8]
+        // which NULL-faults with FAR = 0 when left zero (LOG.md 30.7). m1n1
+        // gives each a 0x4000 buffer.
+        // Together with the 32-byte ChannelRing this puts the channels at +0x18
+        // and shifts everything below by +0x128, which is confirmed by three
+        // pointers the firmware reads at their shifted positions (fault_info
+        // 0x2b8, hwdata_b 0x2c8, fwlog_ring2 0x2d8). LOG.md 8.3.
+        #[ver(V >= V15_5)]
+        pub(crate) hwdata_b_0: GpuPointer<'a, super::HwDataB::ver>,
+        #[ver(V >= V15_5)]
+        pub(crate) unk_8_15_5: U64,
+        #[ver(V >= V15_5)]
+        pub(crate) unk_10_15_5: U64,
+
         pub(crate) pipes: Array<4, PipeChannels::ver>,
 
         pub(crate) device_control:
-            ChannelRing<channels::ChannelState, channels::DeviceControlMsg::ver>,
-        pub(crate) event: ChannelRing<channels::ChannelState, channels::RawEventMsg>,
-        pub(crate) fw_log: ChannelRing<channels::FwLogChannelState, channels::RawFwLogMsg>,
-        pub(crate) ktrace: ChannelRing<channels::ChannelState, channels::RawKTraceMsg>,
-        pub(crate) stats: ChannelRing<channels::ChannelState, channels::RawStatsMsg::ver>,
+            ChannelSlot::ver<channels::ChannelState, channels::DeviceControlMsg::ver>,
 
+        // ⚠️ 15.5 has **no event and no stats slot here**. Only three channels
+        // live in RegionB -- device control, fwlog and ktrace -- and the 0x50
+        // bytes that 13.5 spends on `__pad0` hold the fwlog payload pointer and
+        // its two per-sub-channel counter arrays. Read straight off the
+        // producer at 0x30a40:
+        //
+        //     ldr x9,  [RegionB, #456]   ; 0x1c8 = fwlog slot (0x1b8) pair2 state
+        //     ldr x10, [RegionB, #464]   ; 0x1d0 = fwlog slot (0x1b8) pair2 ring
+        //     ldr x8,  [RegionB, #504]   ; 0x1f8 = payload buffer
+        //     ldr w12, [RegionB + sub*4, #512]   ; 0x200 = payload index
+        //     ldr w9,  [RegionB + sub*4, #544]   ; 0x220 = overflow counter
+        //     ldr w9,  [RegionB, #576]   ; 0x240 = events_enabled
+        //
+        // and confirmed by what the driver received while it still believed the
+        // 13.5 order: the slot at 0x1b8 delivered `{msg_type: 2, msg_index}`
+        // (fwlog), and the one at 0x1d8 delivered `{msg_type: 26, timestamp}`
+        // (ktrace). The old layout also had the firmware writing 216-byte log
+        // records through what the driver had put at 0x1f8 -- the *ktrace
+        // channel state pointer* -- and incrementing the ktrace ring pointer at
+        // 0x200 once per log line. LOG.md 32.34.
+        #[ver(V < V15_5)]
+        pub(crate) event: ChannelSlot::ver<channels::EventChannelState, channels::RawEventMsg>,
+        #[ver(V < V15_5)]
+        pub(crate) fw_log: ChannelSlot::ver<channels::FwLogChannelState, channels::RawFwLogMsg>,
+        #[ver(V < V15_5)]
+        pub(crate) ktrace: ChannelSlot::ver<channels::ChannelState, channels::RawKTraceMsg::ver>,
+
+        // 15.5's receive slots are **sixteen** bytes -- a bare
+        // `{state, ring}` -- so all four of 13.5's rx channels still fit
+        // between device control (0x198) and the fwlog payload pointer
+        // (0x1f8), four slots instead of two:
+        //
+        //     0x1b8 event   0x1c8 fwlog   0x1d8 ktrace   0x1e8 stats
+        //
+        // The fwlog producer at 0x30a40 reads its state from 0x1c8 and its
+        // ring from 0x1d0, which is what pins fwlog to the *second* slot and
+        // therefore leaves the first one for events. With 32-byte
+        // `ChannelSlot`s here, `new_rx` aliased each channel into the next
+        // slot: fwlog's duplicate landed on 0x1c8 (which is why the firmware
+        // log worked and looked like proof that fwlog lived at 0x1b8), ktrace's
+        // landed on the stats slot -- and the event channel did not exist at
+        // all, so no job completion was ever signalled and every submission
+        // hung. LOG.md 32.39.
+        #[ver(V >= V15_5)]
+        pub(crate) event_15_5: ChannelRing<channels::EventChannelState, channels::RawEventMsg>,
+        #[ver(V >= V15_5)]
+        pub(crate) fw_log_15_5: ChannelRing<channels::FwLogChannelState, channels::RawFwLogMsg>,
+
+        // ⚠️ The correction to the correction: 15.5 *does* have a statistics
+        // channel here, and it is what the 32-byte ktrace slot was covering up.
+        // Below device control and fwlog the slots are **sixteen** bytes, not
+        // thirty-two -- ktrace at 0x1d8 and stats at 0x1e8, each just
+        // `{state, ring}`:
+        //
+        //     0x10484  ldr x20, [RegionB, #488]   ; 0x1e8, the stats state
+        //     0x1049c  ldr w24, [x20, #32]        ; write_ptr
+        //     0x104a8  ldr w8,  [x20]             ; read_ptr, ring of 256
+        //     0x1057c  ldr x8,  [RegionB, #496]   ; 0x1f0, the stats ring
+        //
+        // and when it fills, the firmware rings the host (`ep 0x20`, message
+        // `0x42 << 48`), prints "Waiting for space to add statistics!" and
+        // *spins*. With ktrace built as a `ChannelSlot`, `new_rx` duplicated
+        // its state and ring into 0x1e8/0x1f0, so every statistic went into the
+        // ktrace ring, nothing drained it, and the firmware sat in that spin
+        // instead of servicing device control -- which is exactly the
+        // "GpuContext: Failed to invalidate GPU context!" the driver reported.
+        // LOG.md 32.39.
+        #[ver(V >= V15_5)]
+        pub(crate) ktrace_15_5: ChannelRing<channels::ChannelState, channels::RawKTraceMsg::ver>,
+        #[ver(V >= V15_5)]
+        pub(crate) stats_15_5: ChannelRing<channels::ChannelState, channels::RawStatsMsg::ver>,
+
+        #[ver(V < V15_5)]
+        pub(crate) stats: ChannelSlot::ver<channels::ChannelState, channels::RawStatsMsg::ver>,
+
+        #[ver(V < V15_5)]
         pub(crate) __pad0: Pad<0x50>,
+
+        #[ver(V >= V15_5)]
+        pub(crate) fwlog_payload: Option<GpuWeakPointer<[channels::RawFwLogPayloadMsg]>>,
+        #[ver(V >= V15_5)]
+        pub(crate) fwlog_index: Array<8, u32>,
+        #[ver(V >= V15_5)]
+        pub(crate) fwlog_overflow: Array<8, u32>,
+
+        // 15.5 put real fields in what 13.5 treats as padding.
+        //
+        // ⚠️ `events_enabled` is why the firmware has never once signalled this
+        // driver. The event producer opens with
+        //     0x30a44  ldr w9, [x8, #576]      ; RegionB + 0x240
+        //     0x30a48  cbz w9, <return>
+        // and the *only* MSG_RX_DOORBELL the firmware ever sends is at the far
+        // end of that function (0x30b8c, `ep 0x20, msg 0x42 << 48`). Left zero,
+        // the coprocessor is mute by construction. LOG.md 32.15.
+        //
+        // `pipe_tables` are four **unaligned** per-pipe pointers; 0x36718 does
+        // `str wzr, [*(RegionB+0x25c)]`, an unconditional store through the
+        // last of them.
+        #[ver(V >= V15_5)]
+        pub(crate) events_enabled: u32,
+        #[ver(V >= V15_5)]
+        pub(crate) pipe_tables: Array<4, U64>,
+        #[ver(V >= V15_5)]
+        pub(crate) __pad0b: Pad<0x24>,
+
         pub(crate) unk_160: U64,
         pub(crate) unk_168: U64,
         pub(crate) stats_vtx: GpuPointer<'a, super::GpuGlobalStatsVtx>,
@@ -965,10 +1314,74 @@ pub(crate) mod raw {
         pub(crate) stats_comp: GpuPointer<'a, super::GpuStatsComp>,
         pub(crate) hwdata_a: GpuPointer<'a, super::HwDataA::ver>,
         pub(crate) unkptr_190: GpuPointer<'a, &'a [u8]>,
+
+        // 🔑 15.5 replaces 13.5's five pointers here (`unkptr_198`, two more
+        // copies of `hwdata_b`, a second `fwlog_buf` and `unkptr_1b8` -- forty
+        // bytes, none of which any consumer of the RegionB global reads) with
+        // the two descriptor-table address pairs and two config words.
+        //
+        // `AGXArmFirmware::initFirmwareData` (kc:0x9101264..0x9101358) fills
+        // exactly this range, through four accelerator accessors resolved by
+        // their PAC discriminators in the `AGXAcceleratorG15` vtable:
+        //
+        //     [0x2c0] = getPBDescriptorTableGPUAddress()
+        //     [0x2c8] = getPBDescriptorTableFWAddress()
+        //     [0x2d0] = getUMAPagePoolDescriptorTableGPUAddress()
+        //     [0x2d8] = getUMAPagePoolDescriptorTableFWAddress()
+        //     [0x2e0] = u32 from accel+0xf528
+        //     [0x2e4] = u32 from accel+0xf59c
+        //
+        // and the firmware reads the last two straight off its RegionB global:
+        // `adrp x21, 0x1a3000 ; ldr x8, [x21, #64] ; ldr w0, [x8, #740]`
+        // (fw:0x8004) and the same for +736 at fw:0x8e44 and fw:0xb628. That is
+        // what anchors this block to RegionB rather than to any assumed
+        // spacing. LOG.md 32.41.73.
+        #[ver(V >= V15_5)]
+        pub(crate) buffer_mgr_ctl_gpu_addr_15_5: U64,
+        #[ver(V >= V15_5)]
+        pub(crate) buffer_mgr_ctl_fw_addr_15_5: U64,
+        #[ver(V >= V15_5)]
+        pub(crate) uma_pool_ctl_gpu_addr: U64,
+        #[ver(V >= V15_5)]
+        pub(crate) uma_pool_ctl_fw_addr: U64,
+
+        // 🔑 `MAX_TGMEM`, and the firmware reads a 0 here as "override it to 0".
+        // fw:0xb628 skips the whole config-RAM update only when this field
+        // already reads 4:
+        //
+        //     ldr  x9, [x21, #64]        ; the RegionB global
+        //     ldr  w9, [x9, #736]        ; this field
+        //     cmp  w9, #0x4
+        //     b.eq skip
+        //     mov  w10, #0xa728          ; config-RAM selector
+        //     ldr  x8, [x8, x10]
+        //     and  x8, x8, #~0x3f00      ; clear bits 13:8
+        //     orr  x19, x8, x9, lsl #8   ; insert this field
+        //     str  x19, [x8, x9]         ; write it back
+        //
+        // So leaving it zero does not leave the hardware default alone -- the
+        // firmware actively programs
+        // `AGX_CR_USC_TP_GLOBAL_RESOURCE_CFG0_MAX_TGMEM` to **zero**, and its
+        // own verification pass then warns that the register is 0 where it
+        // expected 4. That warning has been in every capture since bring-up and
+        // was filed as unrelated noise. `halGetDefaultUscMaxTgmem()` returns 4
+        // and `halGetMaxUscMaxTgmem()` returns 0x3f -- exactly the six-bit
+        // field at bits 13:8. A USC with no threadgroup memory has to source
+        // all of it from UMA, which is what `gUPM` is. LOG.md 32.41.73.
+        #[ver(V >= V15_5)]
+        pub(crate) usc_max_tgmem: u32,
+        #[ver(V >= V15_5)]
+        pub(crate) unk_2e4: u32,
+
+        #[ver(V < V15_5)]
         pub(crate) unkptr_198: GpuPointer<'a, &'a [u8]>,
+        #[ver(V < V15_5)]
         pub(crate) hwdata_b: GpuPointer<'a, super::HwDataB::ver>,
+        #[ver(V < V15_5)]
         pub(crate) hwdata_b_2: GpuPointer<'a, super::HwDataB::ver>,
+        #[ver(V < V15_5)]
         pub(crate) fwlog_buf: Option<GpuWeakPointer<[channels::RawFwLogPayloadMsg]>>,
+        #[ver(V < V15_5)]
         pub(crate) unkptr_1b8: GpuPointer<'a, &'a [u8]>,
 
         #[ver(G < G14X)]
@@ -979,8 +1392,17 @@ pub(crate) mod raw {
         pub(crate) unk_1d0: u32,
         pub(crate) unk_1d4: u32,
         pub(crate) unk_1d8: Array<0x3c, u8>,
+        // ⚠️ 13.5 only. On 15.5 the pair moved to 0x2c0/0x2c8 (see the block
+        // above `unk_1d0`), and RegionB+0x328/0x32c/0x330 are three u32s the
+        // firmware reads through its own global -- so writing an IOVA across
+        // them here is actively wrong. LOG.md 32.41.73.
+        #[ver(V < V15_5)]
         pub(crate) buffer_mgr_ctl_gpu_addr: U64,
+        #[ver(V < V15_5)]
         pub(crate) buffer_mgr_ctl_fw_addr: U64,
+        #[ver(V >= V15_5)]
+        pub(crate) unk_32c: Array<0x10, u8>,
+
         pub(crate) __pad1: Pad<0x5c>,
         pub(crate) gpu_scratch: RuntimeScratch::ver,
     }
@@ -1255,18 +1677,85 @@ pub(crate) mod raw {
         pub(crate) unk_c: u32,
         pub(crate) runtime_pointers: GpuPointer<'a, super::RuntimePointers::ver>,
         pub(crate) globals: GpuPointer<'a, super::Globals::ver>,
+
+        #[ver(V < V15_5)]
         pub(crate) fw_status: GpuPointer<'a, super::FwStatus>,
+
+        // 15.5 dropped fw_status from InitData -- of the 0xc8 bytes it copies,
+        // the only field anything reads back is +0x2c. Apple's own builder
+        // stores a __DATA_CONST constant here: +0x28 = 0, +0x2c = 1, and +0x2c
+        // is the field the "Host-mapped FW allocations are disabled" panic
+        // checks. LOG.md 10.2.
+        #[ver(V >= V15_5)]
+        pub(crate) unk_28: u32,
+        #[ver(V >= V15_5)]
+        pub(crate) host_mapped_fw_allocations_15_5: u32,
+
         pub(crate) uat_page_size: u16,
         pub(crate) uat_page_bits: u8,
         pub(crate) uat_num_levels: u8,
         pub(crate) uat_level_info: Array<0x3, UatLevelInfo>,
         pub(crate) __pad0: Pad<0x14>,
+
+        #[ver(V < V15_5)]
         pub(crate) host_mapped_fw_allocations: u32,
+        #[ver(V < V15_5)]
         pub(crate) unk_ac: u32,
+        #[ver(V < V15_5)]
         pub(crate) unk_b0: u32,
+        #[ver(V < V15_5)]
         pub(crate) unk_b4: u32,
+        #[ver(V < V15_5)]
         pub(crate) unk_b8: u32,
+
+        // 15.5 replaced those five u32s with four 64-bit pointers, each stashed
+        // in its own firmware global by the InitData consumer. Confirmed on
+        // hardware: passing the literal 1 here (13.5's
+        // host_mapped_fw_allocations) faults with FAR = 0x1. +0xa8 points at a
+        // log/trace enable mask; +0xb0 at a >=0xcdcc structure that carries the
+        // FWCtl channel at +0x4f78/+0x4f80. LOG.md 9.2, 9.3, 15.1.
+        #[ver(V >= V15_5)]
+        pub(crate) unkptr_a8: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V15_5)]
+        pub(crate) unkptr_b0: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V15_5)]
+        pub(crate) unkptr_b8: GpuPointer<'a, &'a [u8]>,
+        #[ver(V >= V15_5)]
+        pub(crate) unkptr_c0: GpuPointer<'a, &'a [u8]>,
     }
+
+    /// Layout check for the 15.5 InitData port (LOG.md 10.2, 9.2).
+    #[versions(AGX)]
+    #[ver(V >= V15_5)]
+    const _LAYOUT_INITDATA: () = {
+        assert!(core::mem::offset_of!(InitData::ver<'static>, runtime_pointers) == 0x18);
+        assert!(core::mem::offset_of!(InitData::ver<'static>, globals) == 0x20);
+        assert!(core::mem::offset_of!(InitData::ver<'static>, host_mapped_fw_allocations_15_5) == 0x2c);
+        assert!(core::mem::offset_of!(InitData::ver<'static>, unkptr_a8) == 0xa8);
+        assert!(core::mem::size_of::<InitData::ver<'static>>() == 0xc8);
+    };
+
+    /// The 15.5 RegionB tail, anchored to the two offsets the firmware reads
+    /// straight off its own global. LOG.md 32.41.73.
+    #[versions(AGX)]
+    #[ver(V >= V15_5)]
+    const _LAYOUT_REGIONB_TAIL: () = {
+        assert!(
+            core::mem::offset_of!(RuntimePointers::ver<'static>, buffer_mgr_ctl_gpu_addr_15_5)
+                == 0x2c0
+        );
+        assert!(
+            core::mem::offset_of!(RuntimePointers::ver<'static>, uma_pool_ctl_gpu_addr) == 0x2d0
+        );
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, usc_max_tgmem) == 0x2e0);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, unk_2e4) == 0x2e4);
+        // Nothing below may move: the firmware reads `gpu_scratch` fields at
+        // fixed RegionB offsets (RegionB+0x451, +0x6b38).
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, unk_1d0) == 0x2e8);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, unk_32c) == 0x32c);
+        assert!(core::mem::offset_of!(RuntimePointers::ver<'static>, __pad1) == 0x33c);
+        assert!(core::mem::size_of::<RuntimePointers::ver<'static>>() == 46296);
+    };
 }
 
 #[derive(Debug)]
@@ -1324,9 +1813,46 @@ pub(crate) struct RuntimePointers {
     pub(crate) unkptr_1c0: GpuArray<u8>,
     pub(crate) unkptr_1c8: GpuArray<u8>,
 
+    /// The u32 the firmware's push-telemetry accounting watches for change.
+    /// Its GPU address lives at `HwDataA + 0x3a30`; the firmware dereferences
+    /// that slot unconditionally, so it may not be null.
+    #[ver(V >= V15_5)]
+    pub(crate) ptd_watch: GpuArray<u8>,
+
+    /// Backing for the two pointer slots in 15.5's RegionB header.
+    #[ver(V >= V15_5)]
+    pub(crate) unk_8_15_5: GpuArray<u8>,
+    #[ver(V >= V15_5)]
+    pub(crate) unk_10_15_5: GpuArray<u8>,
+
+    /// Backing for RegionB+0x244..0x25c, four per-pipe tables (15.5 only).
+    #[ver(V >= V15_5)]
+    pub(crate) pipe_tables: GpuArray<u8>,
+
     pub(crate) buffer_mgr_ctl: gem::ObjectRef,
+    /// CPU address of the PB descriptor table (15.5), for the hang dump.
+    pub(crate) buffer_mgr_ctl_cpu: usize,
     pub(crate) buffer_mgr_ctl_low_mapping: Option<mmu::KernelMapping>,
     pub(crate) buffer_mgr_ctl_high_mapping: Option<mmu::KernelMapping>,
+
+    /// The pass-page counter page, dual-mapped like `buffer_mgr_ctl`.
+    /// `Scene.control_word` + register `0x1c910` carry the LOW address (gPM
+    /// increments the u32 there); `Scene.control_word2` carries the HIGH one
+    /// (the firmware CPU reads and clears it into `pass_page_count`).
+    /// LOG.md 32.41.507/.508.
+    pub(crate) pm_counter_obj: gem::ObjectRef,
+    pub(crate) pm_counter_low_mapping: Option<mmu::KernelMapping>,
+    pub(crate) pm_counter_high_mapping: Option<mmu::KernelMapping>,
+
+    /// The UMA page pool descriptor table -- the second of the two hardware
+    /// mappings `createHardwareMappings` builds, dual-mapped exactly like
+    /// `buffer_mgr_ctl`. Allocated on every version; only 15.5 publishes its
+    /// addresses. LOG.md 32.41.72.
+    pub(crate) uma_pool_ctl: gem::ObjectRef,
+    /// CPU address of `uma_pool_ctl`'s first page, for the fault-path dump.
+    pub(crate) uma_pool_ctl_cpu: usize,
+    pub(crate) uma_pool_ctl_low_mapping: Option<mmu::KernelMapping>,
+    pub(crate) uma_pool_ctl_high_mapping: Option<mmu::KernelMapping>,
 }
 
 #[versions(AGX)]
@@ -1344,6 +1870,18 @@ pub(crate) struct InitData {
     pub(crate) runtime_pointers: GpuObject<RuntimePointers::ver>,
     pub(crate) globals: GpuObject<Globals::ver>,
     pub(crate) fw_status: GpuObject<FwStatus>,
+
+    // 15.5 only: the two InitData tail pointers the firmware dereferences.
+    // Contents unknown; zeroed is enough to get past bring-up, and +0xa8's
+    // first word is a log/trace mask where zero means "quiet". LOG.md 10.4.
+    #[ver(V >= V15_5)]
+    pub(crate) unkbuf_a8: GpuArray<u8>,
+    #[ver(V >= V15_5)]
+    pub(crate) unkbuf_b0: GpuArray<u8>,
+    #[ver(V >= V15_5)]
+    pub(crate) unkbuf_b8: GpuArray<u8>,
+    #[ver(V >= V15_5)]
+    pub(crate) unkbuf_c0: GpuArray<u8>,
 }
 
 #[versions(AGX)]

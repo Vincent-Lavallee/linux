@@ -63,6 +63,8 @@ struct Vm {
     vm: mmu::Vm,
     kernel_range: Range<u64>,
     _dummy_mapping: mmu::KernelMapping,
+    /// Render UMA pool shared by all queues of this VM (Apple: one per process). LOG.md 32.41.664.
+    uma: crate::buffer::UmaSlot,
 }
 
 impl Drop for Vm {
@@ -89,6 +91,12 @@ impl Drop for Vm {
         }
 
         self.vm.bo_deferred_cleanup();
+
+        // 667zzj: the process is gone -> free its UMA id now; the pool memory
+        // stays in crate::buffer's per-id grave until the id's next owner installs.
+        if let Some(u) = self.uma.lock().take() {
+            crate::buffer::uma_release_id(u.id(), u.token);
+        }
     }
 }
 
@@ -213,7 +221,22 @@ pub(crate) struct File {
 pub(crate) type DrmFile = drm::File<File>;
 
 /// Available VM range for the user
-const VM_USER_RANGE: Range<u64> = mmu::IOVA_USER_USABLE_RANGE;
+///
+/// Clamped to 1 << 38 on G15S. The VDM control-stream base register (0x1c880)
+/// carries the address with a **2-bit segment in bits [37:36]**, so the vertex
+/// data master cannot reach above 2^38 no matter what the page tables say --
+/// measured three times, the hardware always fetches from
+/// `((segment + 1) << 36) | (addr & 0xfffffffff)`.  LOG.md 32.41.37.
+///
+/// Do NOT clamp further: Mesa lays out its heaps at fixed addresses
+/// (`usc_exec_base` alone sits at 0x1100000000 = 2^36 + 2^32), so anything at or
+/// below 1 << 36 fails outright with "Failed to allocate BO VMA".  1 << 38
+/// leaves that layout intact.  LOG.md 32.41.27.
+/// include/uapi/drm/asahi_drm.h DRM_ASAHI_QUEUE_G15 (local: the Rust uapi
+/// bindings are generated with the core kernel, not this module).
+const DRM_ASAHI_QUEUE_G15: u32 = 1 << 0;
+
+const VM_USER_RANGE: Range<u64> = mmu::IOVA_USER_BASE..(1 << 38);
 
 /// Minimum reserved AS for kernel mappings
 const VM_KERNEL_MIN_SIZE: u64 = 0x20000000;
@@ -371,7 +394,14 @@ impl File {
             ..align_down(kernel_range.end, buffer::PAGE_SIZE as u64);
 
         let kernel_half_size = align_down(kernel_range.range() >> 1, buffer::PAGE_SIZE as u64);
-        let kernel_gpu_range = kernel_range.start..(kernel_range.start + kernel_half_size);
+        // .667zzz41 DIAGNOSTIC (ualloc_jitter): per-file offset of the shared kernel-VA heap, so
+        // concurrent processes' preempt/spill buffers do not sit at the same VA.
+        let ujit = if *crate::module_parameters::ualloc_jitter.value() != 0 {
+            (u64::from(file.inner().id) % 31) << 28
+        } else {
+            0
+        };
+        let kernel_gpu_range = (kernel_range.start + ujit)..(kernel_range.start + kernel_half_size);
         let kernel_gpufw_range = kernel_gpu_range.end..kernel_range.end;
 
         let gpu = &device.gpu;
@@ -395,7 +425,7 @@ impl File {
                 &vm,
                 kernel_gpu_range,
                 buffer::PAGE_SIZE,
-                mmu::PROT_GPU_SHARED_RW,
+                mmu::uprot(mmu::PROT_GPU_SHARED_RW),
                 512 * 1024,
                 true,
                 fmt!("File {} VM {} GPU Shared", file_id, id),
@@ -427,7 +457,9 @@ impl File {
         let mut dummy_obj = gem::new_kernel_object(device, 0x4000)?;
         dummy_obj.vmap()?.memset(0);
         let dummy_mapping =
-            dummy_obj.map_at(&vm, mmu::IOVA_UNK_PAGE, mmu::PROT_GPU_SHARED_RW, true)?;
+            dummy_obj.map_at(&vm, mmu::IOVA_UNK_PAGE, mmu::uprot(mmu::PROT_GPU_SHARED_RW), true)?;
+
+        let uma = Arc::pin_init(kernel::new_mutex!(None), GFP_KERNEL)?;
 
         mod_dev_dbg!(device, "[File {} VM {}]: VM created\n", file_id, id);
         resv.fill(KBox::new(
@@ -437,6 +469,7 @@ impl File {
                 vm,
                 kernel_range,
                 _dummy_mapping: dummy_mapping,
+                uma,
             },
             GFP_KERNEL,
         )?)?;
@@ -468,9 +501,10 @@ impl File {
     ) -> Result<u32> {
         mod_dev_dbg!(
             device,
-            "[File {}]: IOCTL: gem_create size={:#x?}\n",
+            "[File {}]: IOCTL: gem_create size={:#x?} flags={:#x}\n",
             file.inner().id,
-            data.size
+            data.size,
+            data.flags
         );
 
         if (data.flags
@@ -639,12 +673,12 @@ impl File {
 
         let prot = if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0 {
             if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0 {
-                mmu::PROT_GPU_SHARED_RW
+                mmu::uprot(mmu::PROT_GPU_SHARED_RW)
             } else {
-                mmu::PROT_GPU_SHARED_RO
+                mmu::uprot(mmu::PROT_GPU_SHARED_RO)
             }
         } else if data.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0 {
-            mmu::PROT_GPU_SHARED_WO
+            mmu::uprot(mmu::PROT_GPU_SHARED_WO)
         } else {
             cls_pr_debug!(
                 Errors,
@@ -746,6 +780,33 @@ impl File {
     }
 
     pub(crate) fn unbind_gem_object(file: &DrmFile, bo: &gem::Object) -> Result {
+        // 667zzu: a killed process (Firefox kills its GPU/content processes
+        // on exit) has its handles closed by drm_gem_release while its last
+        // jobs still run. Unmapping under them faults the GPU (UL1C / IPF reads
+        // of the dying context) and costs a firmware timeout + recovery that
+        // stalls every other client. When the closing task is exiting, let the
+        // VM's jobs retire first (bounded; cheap after the first object).
+        // SAFETY: `current` is always a valid task.
+        let exiting =
+            unsafe { (*kernel::task::Task::current_raw()).flags } & bindings::PF_EXITING != 0;
+        if exiting {
+            // Destroy the queues first: tearing down a scheduler entity from a
+            // killed task discards its not-yet-run jobs (drm_sched_entity_flush
+            // / _fini), so only work already handed to the firmware is waited
+            // for below. A busy client can have seconds of queued work.
+            loop {
+                let queues = file.inner().queues();
+                let idx = match queues.find(0, usize::MAX) {
+                    Some((idx, q)) => {
+                        core::mem::drop(q);
+                        idx
+                    }
+                    None => break,
+                };
+                let q = queues.remove(idx);
+                core::mem::drop(q);
+            }
+        }
         // TODO: use iter()
         let mut index = 0;
         loop {
@@ -757,7 +818,21 @@ impl File {
                     // calling drop_mappings()
                     let vm = file_vm.borrow().vm.clone();
                     core::mem::drop(file_vm);
-                    vm.drop_mappings(bo)?;
+                    // A VM poisoned by a GPU hang keeps its mappings. An
+                    // exiting process's firmware-resident jobs either finish
+                    // within the job timeout or are recovered (and the VM
+                    // poisoned); 2 s was too short for unthrottled clients
+                    // (CTS processes that abort: UL1C code-window faults +
+                    // timeouts, .667zzz38). Still busy at the bound: keep the
+                    // memory rather than unmap under running jobs.
+                    let bound = (*module_parameters::job_timeout_ms.value()).max(1000) + 2000;
+                    let keep = exiting && !vm.wait_idle(bound);
+                    if keep && !vm.is_poisoned() {
+                        vm.poison();
+                    }
+                    if !keep {
+                        vm.drop_mappings(bo)?;
+                    }
                     if idx == usize::MAX {
                         break;
                     }
@@ -913,9 +988,30 @@ impl File {
             data.flags,
         );
 
-        if data.flags != 0 || data.priority > uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME {
+        if data.flags & !DRM_ASAHI_QUEUE_G15 != 0
+            || data.priority > uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME
+        {
             cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
             return Err(EINVAL);
+        }
+
+        // 667zzu: a client that does not emit G15 code (stock Mesa, e.g. Steam's
+        // muvm guest) faults the GPU on every job; three in a row crashed the
+        // firmware and killed the desktop. Refuse it up front.
+        if device.gpu.get_dyncfg().id.gpu_gen == crate::hw::GpuGen::G15
+            && data.flags & DRM_ASAHI_QUEUE_G15 == 0
+            && *crate::module_parameters::allow_foreign_clients.value() == 0
+        {
+            // SAFETY: `current` is always valid; comm is NUL-terminated.
+            let comm = unsafe { (*kernel::task::Task::current_raw()).comm };
+            let comm: [u8; 16] = comm.map(|c| c as u8);
+            let n = comm.iter().position(|&c| c == 0).unwrap_or(16);
+            dev_warn!(
+                device.as_ref(),
+                "queue_create: refusing a non-G15 client ({}): its G13/G14 jobs would crash the GPU firmware (allow_foreign_clients=1 to override)\n",
+                core::str::from_utf8(&comm[..n]).unwrap_or("?")
+            );
+            return Err(EPERM);
         }
 
         // TODO: Allow with CAP_SYS_NICE
@@ -932,6 +1028,7 @@ impl File {
         let vm = file_vm.vm.clone();
         let ualloc = file_vm.ualloc.clone();
         let ualloc_priv = file_vm.ualloc_priv.clone();
+        let uma = file_vm.uma.clone();
         // Drop the vms lock eagerly
         let _ = file_vm;
         core::mem::drop(guard);
@@ -943,6 +1040,7 @@ impl File {
             // TODO: Plumb deeper the enum
             uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME - data.priority,
             data.usc_exec_base,
+            uma,
         )?;
 
         data.queue_id = resv.index().try_into()?;

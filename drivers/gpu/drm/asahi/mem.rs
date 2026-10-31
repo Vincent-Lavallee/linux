@@ -134,6 +134,22 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     }
 }
 
+/// Clean and invalidate one cache line to the point of coherency.
+///
+/// Needed when the CPU writes into a buffer the GPU reads uncached. Mesa's own
+/// mappings are write-combining (`gem.rs` `map_wc`), so its writes reach DRAM
+/// without help -- but a kernel write through the cached linear-map alias that
+/// `Page::with_page_mapped` hands out does not, and the GPU would read the
+/// stale line. Only used by the `cs_poke_*` diagnostic. LOG.md 32.41.140.
+#[inline(always)]
+pub(crate) fn dc_civac(addr: *const u8) {
+    // SAFETY: DC CIVAC is permitted at EL1 and cache maintenance on a mapped
+    // address is always safe.
+    unsafe {
+        asm!("dc civac, {x}", x = in(reg) addr);
+    }
+}
+
 /// Issue a memory barrier (`dsb sy`).
 #[inline(always)]
 pub(crate) fn sync() {

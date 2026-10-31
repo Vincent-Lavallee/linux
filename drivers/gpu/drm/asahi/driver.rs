@@ -46,6 +46,8 @@ unsafe impl Sync for AsahiData {}
 pub(crate) struct AsahiDriver {
     #[expect(unused)]
     drm: ARef<drm::Device<Self>>,
+    /// GPU usage files in sysfs (`stats.rs`), removed on unbind.
+    _stats: crate::stats::SysfsFiles,
 }
 
 unsafe impl Send for AsahiDriver {}
@@ -145,6 +147,10 @@ kernel::of_device_table!(
             of::DeviceId::new(c_str!("apple,agx-t6022")),
             &hw::t602x::HWCONFIG_T6022
         ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6030")),
+            &hw::t6030::HWCONFIG_T6030
+        ),
     ]
 );
 
@@ -205,6 +211,10 @@ impl platform::Driver for AsahiDriver {
             (hw::GpuGen::G14, _, &[13, 5, 0]) => {
                 gpu::GpuManagerG14XV13_5::new(&drm.clone(), &res, cfg)? as Arc<dyn gpu::GpuManager>
             }
+            // t6030 (M3 Pro) on macOS 15.5 firmware.
+            (hw::GpuGen::G15, _, &[15, 5, 0]) => {
+                gpu::GpuManagerG15XV15_5::new(&drm.clone(), &res, cfg)? as Arc<dyn gpu::GpuManager>
+            }
             _ => {
                 dev_info!(
                     pdev.as_ref(),
@@ -232,6 +242,9 @@ impl platform::Driver for AsahiDriver {
 
         drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
 
-        Ok(Self { drm })
+        Ok(Self {
+            drm,
+            _stats: crate::stats::SysfsFiles::new(pdev.into()),
+        })
     }
 }

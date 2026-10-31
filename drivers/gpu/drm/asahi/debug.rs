@@ -54,6 +54,10 @@ pub(crate) enum DebugFlags {
     DeviceControlCh = 21,
     FwCtlCh = 22,
 
+    // 23: per-submission trace (~26 lines per render job; off by default, it flooded
+    // printk/journald during long desktop sessions, LOG.md 667zzl)
+    SubmitTrace = 23,
+
     // 32-35: Allocator debugging
     FillAllocations = 32,
     DebugAllocations = 33,
@@ -140,3 +144,38 @@ macro_rules! cls_dev_dbg (
         }
     )
 );
+
+/// pr_info!() for the per-submission trace (debug_flags bit 23)
+#[macro_export]
+macro_rules! sub_pr_info (
+    ($($arg:tt)*) => ({
+        if $crate::debug::debug_enabled($crate::debug::DebugFlags::SubmitTrace) {
+            ::kernel::pr_info! ( $($arg)* );
+        }
+    })
+);
+
+/// dev_info!() for the per-submission trace (debug_flags bit 23)
+#[macro_export]
+macro_rules! sub_dev_info (
+    ($($arg:tt)*) => ({
+        if $crate::debug::debug_enabled($crate::debug::DebugFlags::SubmitTrace) {
+            ::kernel::dev_info! ( $($arg)* );
+        }
+    })
+);
+
+/// dev_err!() sites that are per-submission trace, not errors (debug_flags bit 23)
+#[macro_export]
+macro_rules! sub_dev_err (
+    ($($arg:tt)*) => ({
+        if $crate::debug::debug_enabled($crate::debug::DebugFlags::SubmitTrace) {
+            ::kernel::dev_err! ( $($arg)* );
+        }
+    })
+);
+
+/// Bring-up diagnostics enabled (`asahi.verbose`)?
+pub(crate) fn verbose() -> bool {
+    *crate::module_parameters::verbose.value() != 0
+}

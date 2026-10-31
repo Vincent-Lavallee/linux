@@ -14,19 +14,52 @@ use kernel::sync::Arc;
 pub(crate) mod raw {
     use super::*;
 
+    // 🔑 15.5 8-aligns the stamp quad and moves it from +0x04 to +0x10. The
+    // firmware's completion walk takes the notifier's `pstamp_*` entries as
+    // pointers to a 0x20-byte record and reads
+    //
+    //     ldp x26, x23, [x0]        ; record + 0x00, + 0x08   (two pointers)
+    //     ldp w24, w25, [x0, #16]   ; record + 0x10, + 0x14   (value, slot)
+    //     str w24, [x26]            ; write the stamp
+    //
+    // (`fw:0x1fb70`). The record it was handed for the vertex job was
+    // `command + 0x868`, and `RunVertex::meta` sits at 0x858 -- so the quad
+    // starts at `meta + 0x10`, not `meta + 0x04`. With the pre-15.5 layout the
+    // firmware read `meta + 0x10` as the stamp pointer and got
+    // `fw_stamp_hi | stamp_value << 32` = 0x100fffffe00, which is exactly the
+    // FAR of the data abort it died on. The struct is still 0x2c bytes
+    // (`unk_after_meta` is at 0x884 and the firmware reads `unk_buf_0` at
+    // 0x888, both confirmed), so the four u32s move into the hole the quad
+    // left. LOG.md 32.41.91.
+    #[versions(AGX)]
     #[derive(Debug, Clone, Copy)]
     #[repr(C)]
     pub(crate) struct JobMeta {
         pub(crate) unk_0: u16,
         pub(crate) unk_2: u8,
         pub(crate) no_preemption: u8,
+
+        // ⚠️ 0x04..0x10 on 15.5 is *unidentified*. It is where `evctl_index`,
+        // `flush_stamps` and `uuid` used to sit, but nothing says which of them
+        // goes where now, and one of them is an **index**. Guessing the order
+        // put a userspace-supplied UUID in that slot and wedged the machine
+        // past ssh and past sysrq -- a power cycle, not a crash log. Zeroed
+        // until something measures it. LOG.md 32.41.92.
+        #[ver(V >= V15_5)]
+        pub(crate) unk_4: Array<0xc, u8>,
+
         pub(crate) stamp: GpuWeakPointer<Stamp>,
         pub(crate) fw_stamp: GpuWeakPointer<FwStamp>,
         pub(crate) stamp_value: EventValue,
         pub(crate) stamp_slot: u32,
+
+        #[ver(V < V15_5)]
         pub(crate) evctl_index: u32,
+        #[ver(V < V15_5)]
         pub(crate) flush_stamps: u32,
+        #[ver(V < V15_5)]
         pub(crate) uuid: u32,
+
         pub(crate) event_seq: u32,
     }
 
@@ -108,10 +141,37 @@ pub(crate) mod raw {
             array
         }
 
+        /// Overwrite an already-added register's value in place, leaving the
+        /// list length and ordering untouched. Returns false if absent.
+        ///
+        /// Used to apply macOS's *small-job* values over registers this driver
+        /// programs unconditionally -- appending a second record for the same
+        /// id would change the list length, which the firmware's count and the
+        /// hardware's walk both depend on. LOG.md 32.41.371 (entry LOST -- see 32.41.431).
+        pub(crate) fn set(&mut self, number: u32, value: u64) -> bool {
+            for i in 0..(self.count as usize) {
+                if self.registers[i].number == number {
+                    self.registers[i] = Register::new(number, value);
+                    return true;
+                }
+            }
+            false
+        }
+
         pub(crate) fn add(&mut self, number: u32, value: u64) {
             self.registers[self.count as usize] = Register::new(number, value);
             self.count += 1;
             self.length += core::mem::size_of::<Register>() as u16;
+        }
+
+        /// Print the array as built, so it can be diffed against a macOS
+        /// capture (m1n1's `agx/render.py` carries one).  LOG.md 32.41.41.
+        pub(crate) fn dump(&self, tag: &str) {
+            for i in 0..(self.count as usize) {
+                let number = self.registers[i].number;
+                let value = self.registers[i].value.0;
+                kernel::pr_info!("asahi/reg {} [{}] {:#x} = {:#x}\n", tag, i, number, value);
+            }
         }
     }
 
